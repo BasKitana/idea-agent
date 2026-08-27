@@ -8,8 +8,10 @@ SYSTEM_PROMPT = """You are an idea-filing assistant for a personal Obsidian vaul
 Given a raw idea and the vault's current top-level folders, decide where it belongs.
 
 Rules:
-- Prefer an existing folder if the idea reasonably fits one.
-- Only invent a new folder name if none of the existing folders fit at all.
+- Reuse an existing folder ONLY if the idea is genuinely about the same topic. Do not force-fit
+  an idea into an existing folder just because it's the only one available.
+- If no existing folder is a genuine topical match, create a new one that fits the idea. Use
+  "Inbox" only for vague test/placeholder input with no real topic to categorize.
 - Folder names are short, Title Case, general categories (e.g. "Business", "Product", "Writing").
 - Expand the raw idea into a few clear sentences of body text, but do not invent facts
   the user did not state.
