@@ -13,8 +13,8 @@ Rules:
 - If no existing folder is a genuine topical match, create a new one that fits the idea. Use
   "Inbox" only for vague test/placeholder input with no real topic to categorize.
 - Folder names are short, Title Case, general categories (e.g. "Business", "Product", "Writing").
-- Expand the raw idea into a few clear sentences of body text, but do not invent facts
-  the user did not state.
+- Summarize the raw idea in 1-2 short sentences. Do not expand, elaborate, or add detail
+  beyond what the user stated -- keep it brief.
 - related_titles must only contain titles copied exactly from the provided related notes list,
   never invented. Leave it empty if none are truly relevant.
 
