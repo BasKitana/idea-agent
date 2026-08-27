@@ -1,0 +1,6 @@
+ollama
+sentence-transformers
+numpy
+pyyaml
+rich
+python-dotenv
