@@ -59,10 +59,18 @@ ATOMIZE_SYSTEM_PROMPT = """You decompose a raw capture into atomic notes for a t
 Obsidian vault. The capture has already been confirmed to NOT duplicate any existing note.
 
 NOTE TYPES (choose exactly one per note):
-- concept: a broad technical principle, algorithm, or academic idea
-- project: an active development task, roadmap, or system specification
-- entity: a specific API, organization, person, or distinct component
-- log: a chronological record of something that happened (a meeting, an event)
+- concept: general, reusable technical/academic knowledge that is NOT tied to one specific
+  project of the user's -- e.g. "how HNSW indexing works", "the difference between REST and
+  GraphQL". If it only makes sense in the context of one of the user's own named
+  projects/systems, it is NOT a concept, even if it sounds technical.
+- project: an active development task, roadmap, system specification, or ANY update, detail,
+  feature, or capability added to one of the user's own specific projects. If the capture is
+  clearly about a project the user already has -- it names that project, or you were given it
+  as a strongly related existing note -- default to "project", not "concept".
+- entity: a specific API, organization, person, or distinct external component/tool.
+- log: a chronological record of something that HAPPENED -- an event, a meeting, a specific
+  moment in time. Not every mention of a project is a log entry; only use log when the capture
+  describes an event occurring, not a fact/feature/detail about the project itself.
 
 ATOMICITY:
 - If the capture describes ONE distinct concept, produce exactly ONE note. Do not invent
@@ -110,6 +118,30 @@ def _vague_guard(capture_text: str) -> str:
     return ""
 
 
+def _relation_hint(candidates: list[dict]) -> str:
+    """When there's one dominant strongly-related candidate, name its type
+    explicitly rather than leaving the model to infer relevance from a
+    generic candidate list. Measured directly: type classification for a
+    capture strongly tied to an existing project scattered across
+    concept/project/log (5/8, 1/8, 2/8) even though the related project note
+    was already right there in the candidate list -- the same "secondary
+    signal gets dropped" pattern behind the auto-link fix, just for type
+    instead of links. Reuses AUTO_LINK_SCORE since it's the same "is this
+    genuinely the same context" question."""
+    strong = [c for c in candidates if c.get("score", 0) >= config.AUTO_LINK_SCORE]
+    if len(strong) != 1:
+        return ""
+    c = strong[0]
+    return (
+        f"\nThis capture is strongly related to an existing note: \"{c['title']}\" "
+        f"(type: {c.get('type', 'concept')}). If this capture describes an update, detail, "
+        f"feature, or capability of that SAME project/entity, use its same type -- do not "
+        f"default to \"concept\" just because it's easier. Only use a different type if this "
+        f"capture clearly describes a distinct event (log) or a genuinely separate, general "
+        f"idea unrelated to that specific note.\n"
+    )
+
+
 def _call_meta_check(capture_text: str) -> dict:
     response = ollama.chat(
         model=config.OLLAMA_MODEL, format="json",
@@ -136,6 +168,7 @@ def _call_duplicate_check(capture_text: str, candidates: list[dict]) -> dict:
 def _call_atomize(capture_text: str, candidates: list[dict]) -> dict:
     prompt = (
         f"Related notes (not duplicates):\n{_format_candidates(candidates)}\n"
+        f"{_relation_hint(candidates)}"
         f"{_vague_guard(capture_text)}\nRaw capture:\n{capture_text}"
     )
     response = ollama.chat(

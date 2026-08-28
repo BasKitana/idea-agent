@@ -144,6 +144,34 @@ class TestDuplicateDetection:
         assert result[0]["action"] == "create"
 
 
+class TestRelationHint:
+    """Pure-function tests for the prompt hint that names a dominant related
+    candidate's type explicitly. Measured directly: without this, type
+    classification for a capture strongly tied to an existing project
+    scattered across concept/project/log (5/8, 1/8, 2/8) even though the
+    related note was already in the candidate list."""
+
+    def test_single_strong_candidate_produces_a_hint(self):
+        candidates = [{"title": "Idea Agent Project", "type": "project", "score": 0.7}]
+        hint = agent._relation_hint(candidates)
+        assert "Idea Agent Project" in hint and "project" in hint
+
+    def test_no_strong_candidates_produces_no_hint(self):
+        candidates = [{"title": "Weak Match", "type": "concept", "score": 0.1}]
+        assert agent._relation_hint(candidates) == ""
+
+    def test_multiple_strong_candidates_produces_no_hint(self):
+        # Ambiguous which one the capture is actually about -- don't guess.
+        candidates = [
+            {"title": "A", "type": "project", "score": 0.7},
+            {"title": "B", "type": "concept", "score": 0.6},
+        ]
+        assert agent._relation_hint(candidates) == ""
+
+    def test_empty_candidates_produces_no_hint(self):
+        assert agent._relation_hint([]) == ""
+
+
 class TestAutoLink:
     """Measured directly: given a strongly-related candidate right there in
     the prompt, the model only populated "links" in 4/6 runs -- it forgets,
