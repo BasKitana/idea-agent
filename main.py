@@ -12,18 +12,23 @@ from rag import RagIndex
 console = Console()
 
 HELP_TEXT = """[bold]Commands[/bold]
-  /help   show this message
-  /list   show recently filed ideas
-  /quit   exit
+  /help          show this message
+  /list          show recently filed ideas
+  /quit, /exit   exit
 Anything else you type is filed as a new idea."""
 
 
-def check_ollama() -> bool:
+def check_ollama() -> str | None:
+    """Returns None when ready, or an error message to show the user."""
     try:
-        ollama.Client(host=config.OLLAMA_HOST).list()
-        return True
+        models = ollama.Client(host=config.OLLAMA_HOST).list()
     except Exception:
-        return False
+        return f"Can't reach Ollama at {config.OLLAMA_HOST}.\nStart it with: ollama serve"
+
+    available = {m["model"] for m in models["models"]}
+    if config.OLLAMA_MODEL not in available:
+        return f"Model '{config.OLLAMA_MODEL}' isn't pulled yet.\nRun: ollama pull {config.OLLAMA_MODEL}"
+    return None
 
 
 def process_idea(idea_text: str, index: RagIndex):
@@ -45,7 +50,7 @@ def process_idea(idea_text: str, index: RagIndex):
 
 
 def list_recent(index: RagIndex, n: int = 10):
-    entries = sorted(index.data.items(), key=lambda kv: kv[1]["mtime"], reverse=True)[:n]
+    entries = sorted(index.data.items(), key=lambda kv: kv[1].get("mtime", 0), reverse=True)[:n]
     if not entries:
         console.print("[dim]No ideas filed yet.[/dim]")
         return
@@ -54,12 +59,9 @@ def list_recent(index: RagIndex, n: int = 10):
 
 
 def main():
-    if not check_ollama():
-        console.print(Panel(
-            f"Can't reach Ollama at {config.OLLAMA_HOST}.\n"
-            "Start it with: ollama serve",
-            title="Ollama not running", border_style="red",
-        ))
+    error = check_ollama()
+    if error:
+        console.print(Panel(error, title="Ollama not ready", border_style="red"))
         sys.exit(1)
 
     console.print(Panel(
@@ -81,20 +83,22 @@ def main():
 
         if not text:
             continue
-        if text in ("/quit", "/exit"):
+        command = text.lower()
+        if command in ("/quit", "/exit"):
             break
-        if text == "/help":
-            console.print(HELP_TEXT)
-            continue
-        if text == "/list":
-            list_recent(index)
-            continue
 
         try:
-            with console.status("Thinking..."):
-                process_idea(text, index)
+            if command == "/help":
+                console.print(HELP_TEXT)
+            elif command == "/list":
+                list_recent(index)
+            else:
+                with console.status("Thinking..."):
+                    process_idea(text, index)
+        except (EOFError, KeyboardInterrupt):
+            break
         except Exception as e:
-            console.print(f"[red]Couldn't file that idea: {e}[/red]")
+            console.print(f"[red]Error: {e}[/red]")
 
     console.print("[dim]Bye.[/dim]")
 

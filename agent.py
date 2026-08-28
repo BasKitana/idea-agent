@@ -45,17 +45,46 @@ def _call_ollama(idea_text: str, existing_folders: list[str], related: list[dict
     return json.loads(response["message"]["content"])
 
 
+def _as_str(value, default: str) -> str:
+    if value is None:
+        return default
+    text = str(value).strip()
+    return text or default
+
+
+def _as_str_list(value) -> list[str]:
+    if value is None:
+        return []
+    if isinstance(value, str):
+        return [value.strip()] if value.strip() else []
+    if isinstance(value, list):
+        return [str(v).strip() for v in value if v is not None and str(v).strip()]
+    return []
+
+
+def _normalize(result: dict, idea_text: str, related: list[dict]) -> dict:
+    fallback_title = idea_text.strip()[:60] or "Untitled Idea"
+    result = {str(k).lower(): v for k, v in result.items()}
+
+    related_titles = _as_str_list(result.get("related_titles"))
+    valid_titles = {r["title"] for r in related}
+
+    return {
+        "title": _as_str(result.get("title"), fallback_title)[:120],
+        "folder": _as_str(result.get("folder"), "Inbox"),
+        "tags": _as_str_list(result.get("tags")),
+        "body": _as_str(result.get("body"), idea_text.strip()),
+        "related_titles": [t for t in related_titles if t in valid_titles],
+    }
+
+
 def classify_idea(idea_text: str, existing_folders: list[str], related: list[dict]) -> dict:
     for _ in range(2):
         try:
             result = _call_ollama(idea_text, existing_folders, related)
-            return {
-                "title": str(result["title"]).strip()[:120],
-                "folder": str(result.get("folder") or "Inbox").strip(),
-                "tags": [str(t) for t in result.get("tags", [])],
-                "body": str(result.get("body") or idea_text).strip(),
-                "related_titles": [str(t) for t in result.get("related_titles", [])],
-            }
+            if not isinstance(result, dict):
+                continue
+            return _normalize(result, idea_text, related)
         except Exception:
             # Any failure here (bad JSON, non-dict response, connection drop) should
             # degrade to the Inbox fallback below, never crash the caller.
