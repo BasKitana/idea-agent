@@ -58,6 +58,16 @@ to it) to launch the agent without touching a terminal.
 - `/help` -- show the command list.
 - `/quit` -- exit.
 
+## Tests
+
+```
+pip install -r requirements-dev.txt
+pytest
+```
+
+149 tests, no live Ollama server or network access required -- the embedding model and
+`ollama.chat` are mocked/faked for speed and determinism.
+
 ## Configuration
 
 All settings live in `.env`:
