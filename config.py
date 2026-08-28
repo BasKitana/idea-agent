@@ -14,5 +14,27 @@ VAULT_PATH = Path(_vault_path)
 OLLAMA_HOST = os.environ.get("OLLAMA_HOST", "http://localhost:11434")
 OLLAMA_MODEL = os.environ.get("OLLAMA_MODEL", "qwen2.5:7b-instruct")
 EMBED_MODEL = os.environ.get("EMBED_MODEL", "all-MiniLM-L6-v2")
-TOP_K = int(os.environ.get("TOP_K", "5"))
 INDEX_PATH = VAULT_PATH / ".rag_index.json"
+
+# Closed set of note types -> the exact folder each is routed to. Folder is
+# never free text from the LLM (old design let it invent folder names, which
+# both biased everything toward "Inbox" and was a path-traversal surface).
+FOLDER_BY_TYPE = {
+    "concept": "01_Concepts",
+    "project": "02_Projects",
+    "entity": "03_Entities",
+    "log": "04_Logs",
+}
+
+# Calibrated empirically against all-MiniLM-L6-v2 (see scratchpad/calibrate.py):
+# a real paraphrase scored as low as 0.552, a genuinely different-but-related
+# idea scored as high as 0.516 -- the bands overlap, so no single cosine cutoff
+# can decide "same idea" on its own. DEDUP_RETRIEVE_SCORE is deliberately a low
+# recall-oriented bar for pulling candidates; the LLM then judges each one.
+DEDUP_RETRIEVE_SCORE = float(os.environ.get("DEDUP_RETRIEVE_SCORE", "0.40"))
+DEDUP_TOP_K = int(os.environ.get("DEDUP_TOP_K", "8"))
+
+# Below this word count, forced to exactly one note -- the local model was
+# observed inventing 4-5 fictional sub-topics when asked to atomize vague
+# one-line input instead of just capturing it as-is.
+ATOMIZE_MIN_WORDS = int(os.environ.get("ATOMIZE_MIN_WORDS", "12"))

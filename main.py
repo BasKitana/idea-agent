@@ -1,10 +1,13 @@
 import sys
+from datetime import date
 
 import ollama
 from rich.console import Console
+from rich.markup import escape
 from rich.panel import Panel
 
 import agent
+import bases
 import config
 import vault
 from rag import RagIndex
@@ -13,9 +16,9 @@ console = Console()
 
 HELP_TEXT = """[bold]Commands[/bold]
   /help          show this message
-  /list          show recently filed ideas
+  /list          show recently filed notes
   /quit, /exit   exit
-Anything else you type is filed as a new idea."""
+Anything else you type is captured, atomized, and filed."""
 
 
 def check_ollama() -> str | None:
@@ -31,31 +34,75 @@ def check_ollama() -> str | None:
     return None
 
 
-def process_idea(idea_text: str, index: RagIndex):
-    related = index.query(idea_text)
-    result = agent.classify_idea(idea_text, vault.list_folders(config.VAULT_PATH), related)
-    path = vault.write_note(
-        config.VAULT_PATH, result["folder"], result["title"],
-        result["tags"], result["body"], result["related_titles"],
+def process_capture(capture_text: str, index: RagIndex):
+    candidates = index.query(
+        capture_text, top_k=config.DEDUP_TOP_K, min_score=config.DEDUP_RETRIEVE_SCORE,
     )
-    try:
-        index.add(path, result["title"], f"{result['title']}\n{result['body']}")
-    except Exception:
-        console.print("[yellow]Filed, but the RAG index update failed -- it'll resync next launch.[/yellow]")
+    items = agent.process_capture(capture_text, candidates)
 
-    body = f"[bold]{result['title']}[/bold]\nFolder: {result['folder']}\nFile: {path}"
-    if result["related_titles"]:
-        body += "\nLinked: " + ", ".join(result["related_titles"])
-    console.print(Panel(body, title="Filed", border_style="green"))
+    today = date.today().isoformat()
+    created = []       # (title, path, links)
+    duplicates = []    # (capture_text, existing_title)
+    failed = []        # (title_or_desc, error)
+
+    for item in items:
+        try:
+            if item["action"] == "create":
+                links = list(dict.fromkeys(item["links"] + [today]))  # anti-orphan: always link today's log
+                path = vault.write_note(
+                    config.VAULT_PATH, item["type"], item["title"],
+                    item["tags"], item["body"], links,
+                )
+                try:
+                    index.add(path, item["title"], f"{item['title']}\n{item['body']}", note_type=item["type"])
+                except Exception:
+                    console.print(f"[yellow]Filed '{item['title']}', but the RAG index update "
+                                  "failed -- it'll resync next launch.[/yellow]")
+                created.append((item["title"], path, item["type"]))
+            elif item["action"] == "duplicate":
+                duplicates.append((capture_text, item["duplicate_of"]))
+        except Exception as e:
+            failed.append((item.get("title") or item.get("duplicate_of") or "?", e))
+
+    if created or duplicates:
+        vault.append_daily_log_links(
+            config.VAULT_PATH, [t for t, _, _ in created], duplicates,
+        )
+
+    _print_summary(created, duplicates, failed)
+
+
+def _print_summary(created, duplicates, failed):
+    # Titles/paths/errors are LLM-generated or user-supplied text and may
+    # contain literal [brackets] -- console.print() treats those as markup
+    # tags, so unescaped dynamic text can be silently mangled or dropped
+    # (caught live: a bracketed type prefix vanished entirely). Escape every
+    # dynamic value before interpolating it into a Rich-printed string.
+    lines = []
+    for title, path, note_type in created:
+        lines.append(f"[bold green]+ {escape(title)}[/bold green] "
+                      f"[dim]({escape(note_type)} -> {escape(str(path))})[/dim]")
+    for raw, existing in duplicates:
+        lines.append(f"[bold yellow]= already covered[/bold yellow] -> "
+                      f"[[{escape(existing)}]]")
+    for desc, err in failed:
+        lines.append(f"[bold red]x {escape(str(desc))}: {escape(str(err))}[/bold red]")
+
+    if not lines:
+        console.print("[dim]Nothing came of that.[/dim]")
+        return
+    console.print(Panel("\n".join(lines), title="Processed", border_style="cyan"))
 
 
 def list_recent(index: RagIndex, n: int = 10):
     entries = sorted(index.data.items(), key=lambda kv: kv[1].get("mtime", 0), reverse=True)[:n]
     if not entries:
-        console.print("[dim]No ideas filed yet.[/dim]")
+        console.print("[dim]No notes filed yet.[/dim]")
         return
     for key, entry in entries:
-        console.print(f"  {entry['title']}  [dim]({key})[/dim]")
+        note_type = escape(str(entry.get("type", "?")))
+        title = escape(str(entry.get("title", key)))
+        console.print(f"  {note_type}: {title}  [dim]({escape(key)})[/dim]")
 
 
 def main():
@@ -66,18 +113,22 @@ def main():
 
     console.print(Panel(
         f"Vault: {config.VAULT_PATH}\nModel: {config.OLLAMA_MODEL}",
-        title="Idea Agent", border_style="cyan",
+        title="Knowledge Agent", border_style="cyan",
     ))
 
     index = RagIndex()
     with console.status("Indexing existing notes..."):
         index.sync()
+    try:
+        bases.write_index(config.VAULT_PATH)
+    except Exception:
+        pass  # the Bases index is a convenience, never worth blocking startup over
 
     console.print(HELP_TEXT)
 
     while True:
         try:
-            text = console.input("\n[bold cyan]idea>[/bold cyan] ").strip()
+            text = console.input("\n[bold cyan]capture>[/bold cyan] ").strip()
         except (EOFError, KeyboardInterrupt):
             break
 
@@ -94,7 +145,7 @@ def main():
                 list_recent(index)
             else:
                 with console.status("Thinking..."):
-                    process_idea(text, index)
+                    process_capture(text, index)
         except (EOFError, KeyboardInterrupt):
             break
         except Exception as e:

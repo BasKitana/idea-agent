@@ -93,11 +93,11 @@ class TestQuery:
         rag_index.sync()
         assert rag_index.query("water", top_k=0) == []
 
-    def test_top_k_none_uses_config_default(self, vault_path, rag_index):
+    def test_top_k_none_uses_default_of_five(self, vault_path, rag_index):
         for i in range(10):
             make_note(vault_path, "Health", f"Note{i}", text=f"water idea number {i}")
         rag_index.sync()
-        assert len(rag_index.query("water idea", top_k=None, min_score=-1)) == config.TOP_K
+        assert len(rag_index.query("water idea", top_k=None, min_score=-1)) == 5
 
     def test_top_k_larger_than_index_is_clamped(self, vault_path, rag_index):
         make_note(vault_path, "Health", "Water")
@@ -138,3 +138,41 @@ class TestQuery:
         rag_index.data["Health/Zero.md"] = {"mtime": 1, "title": "Zero", "embedding": [0] * dim}
         results = rag_index.query("good", min_score=-1)
         assert all(not np.isnan(r["score"]) for r in results)
+
+
+class TestTypeAndExcerpt:
+    def test_sync_infers_type_from_mandated_folder(self, vault_path, rag_index):
+        make_note(vault_path, "02_Projects", "MyProject")
+        rag_index.sync()
+        assert rag_index.data["02_Projects/MyProject.md"]["type"] == "project"
+
+    def test_sync_defaults_unknown_folder_to_concept(self, vault_path, rag_index):
+        make_note(vault_path, "SomeOtherFolder", "X")
+        rag_index.sync()
+        assert rag_index.data["SomeOtherFolder/X.md"]["type"] == "concept"
+
+    def test_add_stores_explicit_type_over_inferred(self, vault_path, rag_index):
+        d = vault_path / "02_Projects"
+        d.mkdir(parents=True)
+        p = d / "X.md"
+        p.write_text("body", encoding="utf-8")
+        rag_index.add(p, "X", "X\nbody", note_type="entity")
+        assert rag_index.data["02_Projects/X.md"]["type"] == "entity"
+
+    def test_excerpt_strips_frontmatter_and_heading(self, vault_path, rag_index):
+        d = vault_path / "01_Concepts"
+        d.mkdir(parents=True)
+        p = d / "X.md"
+        p.write_text('---\ntitle: "X"\ndate: 2026-08-27\ntype: concept\ntags: []\n---\n'
+                     '\n# X\n\nThe actual body content here.\n', encoding="utf-8")
+        rag_index.sync()
+        excerpt = rag_index.data["01_Concepts/X.md"]["excerpt"]
+        assert "title:" not in excerpt and "# X" not in excerpt
+        assert "actual body content" in excerpt
+
+    def test_query_results_include_type_and_excerpt(self, vault_path, rag_index):
+        make_note(vault_path, "03_Entities", "Vercel", text="An edge platform.")
+        rag_index.sync()
+        results = rag_index.query("edge platform", min_score=-1)
+        assert results[0]["type"] == "entity"
+        assert "edge platform" in results[0]["excerpt"]

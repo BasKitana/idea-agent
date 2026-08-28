@@ -4,42 +4,107 @@ import ollama
 
 import config
 
-SYSTEM_PROMPT = """You are an idea-filing assistant for a personal Obsidian vault.
-Given a raw idea and the vault's current top-level folders, decide where it belongs.
+VALID_TYPES = set(config.FOLDER_BY_TYPE.keys())
 
-Rules:
-- Reuse an existing folder ONLY if the idea is genuinely about the same topic. Do not force-fit
-  an idea into an existing folder just because it's the only one available.
-- If no existing folder is a genuine topical match, create a new one that fits the idea. Use
-  "Inbox" only for vague test/placeholder input with no real topic to categorize.
-- Folder names are short, Title Case, general categories (e.g. "Business", "Product", "Writing").
-- Summarize the raw idea in 1-2 short sentences. Do not expand, elaborate, or add detail
-  beyond what the user stated -- keep it brief.
-- related_titles must only contain titles copied exactly from the provided related notes list,
-  never invented. Leave it empty if none are truly relevant.
+# Split into two focused calls rather than one combined schema. Measured
+# directly: a single call asking the model to both judge duplication AND
+# generate atomic notes in one JSON response strongly biased it toward the
+# generative "create" branch -- it missed an exact-match duplicate in every
+# run, on both a 7B and a 14B model, so this is a structural prompt-design
+# issue, not a model-capacity one. A plain yes/no judgment against retrieved
+# candidates is a much more reliable task for a local model than a rare
+# branch inside a richer generation schema.
 
-Respond with ONLY a JSON object with exactly these keys:
-{"title": str, "folder": str, "tags": [str], "body": str, "related_titles": [str]}
+DUPLICATE_SYSTEM_PROMPT = """You judge whether a new capture is the SAME IDEA as one of a list
+of existing notes. This is a strict equivalence check, not a topic/relevance check.
+
+Answer yes only if the capture and a candidate are clearly describing the same underlying
+idea, just possibly worded differently. Two different ideas about the same general subject
+are NOT the same idea -- answer no for those, even if closely related.
+
+Respond with ONLY a JSON object:
+{"duplicate_of": str or null}
+If yes, duplicate_of is the matching candidate's EXACT title, copied verbatim. If no single
+candidate is genuinely the same idea, duplicate_of is null.
+"""
+
+ATOMIZE_SYSTEM_PROMPT = """You decompose a raw capture into atomic notes for a technical
+Obsidian vault. The capture has already been confirmed to NOT duplicate any existing note.
+
+NOTE TYPES (choose exactly one per note):
+- concept: a broad technical principle, algorithm, or academic idea
+- project: an active development task, roadmap, or system specification
+- entity: a specific API, organization, person, or distinct component
+- log: a chronological record of something that happened (a meeting, an event)
+
+ATOMICITY:
+- If the capture describes ONE distinct concept, produce exactly ONE note. Do not invent
+  additional notes that aren't actually in the input.
+- If the capture genuinely contains multiple distinct concepts (e.g. a project plus a specific
+  technology choice plus something to learn), split into multiple atomic notes, one per
+  concept, and link them to each other via "links".
+- If the capture is vague, short, or a placeholder with no real distinguishable topic, produce
+  exactly ONE note that captures it as-is. NEVER fabricate sub-topics, structure, or
+  elaboration not actually present in the input. Inventing content the user didn't say is a
+  serious failure, worse than under-splitting.
+
+You may also be given RELATED notes (not duplicates, just related) -- link to them by exact
+title when a note you create is genuinely, specifically connected to one.
+
+WRITING STYLE:
+- Information-dense, concise, technical. No fluff, no filler sentences.
+- title: specific and descriptive, not a broad category name.
+- tags: 1-4 short lowercase-hyphenated tags.
+- body: 1-4 sentences. State only what the capture actually said; do not add facts, numbers,
+  or specifics the user did not provide.
+- links: titles of OTHER notes (related notes given to you, or sibling notes in this same
+  response) this note is genuinely, specifically related to. Copy titles exactly, never
+  invent one. Leave empty if nothing is genuinely related.
+
+Respond with ONLY a JSON object:
+{"notes": [{"title": str, "type": "concept|project|entity|log", "tags": [str],
+"body": str, "links": [str]}]}
 """
 
 
-def _build_user_prompt(idea_text: str, existing_folders: list[str], related: list[dict]) -> str:
-    related_lines = "\n".join(f"- {r['title']}" for r in related) or "(none found)"
-    folder_lines = ", ".join(existing_folders) or "(vault is empty, no folders yet)"
-    return (
-        f"Existing folders: {folder_lines}\n\n"
-        f"Related notes already in the vault:\n{related_lines}\n\n"
-        f"Raw idea:\n{idea_text}"
+def _format_candidates(candidates: list[dict]) -> str:
+    if not candidates:
+        return "(none found)"
+    return "\n".join(
+        f'- "{c["title"]}" (type: {c.get("type", "concept")}): {c.get("excerpt", "")}'
+        for c in candidates
     )
 
 
-def _call_ollama(idea_text: str, existing_folders: list[str], related: list[dict]) -> dict:
+def _vague_guard(capture_text: str) -> str:
+    if len(capture_text.split()) < config.ATOMIZE_MIN_WORDS:
+        return ("\nThis capture is short/vague. Produce exactly ONE note. Do not split it, "
+                  "do not invent sub-topics.\n")
+    return ""
+
+
+def _call_duplicate_check(capture_text: str, candidates: list[dict]) -> dict:
+    prompt = f"Existing notes:\n{_format_candidates(candidates)}\n\nNew capture:\n{capture_text}"
     response = ollama.chat(
-        model=config.OLLAMA_MODEL,
-        format="json",
+        model=config.OLLAMA_MODEL, format="json",
         messages=[
-            {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": _build_user_prompt(idea_text, existing_folders, related)},
+            {"role": "system", "content": DUPLICATE_SYSTEM_PROMPT},
+            {"role": "user", "content": prompt},
+        ],
+    )
+    return json.loads(response["message"]["content"])
+
+
+def _call_atomize(capture_text: str, candidates: list[dict]) -> dict:
+    prompt = (
+        f"Related notes (not duplicates):\n{_format_candidates(candidates)}\n"
+        f"{_vague_guard(capture_text)}\nRaw capture:\n{capture_text}"
+    )
+    response = ollama.chat(
+        model=config.OLLAMA_MODEL, format="json",
+        messages=[
+            {"role": "system", "content": ATOMIZE_SYSTEM_PROMPT},
+            {"role": "user", "content": prompt},
         ],
     )
     return json.loads(response["message"]["content"])
@@ -62,38 +127,107 @@ def _as_str_list(value) -> list[str]:
     return []
 
 
-def _normalize(result: dict, idea_text: str, related: list[dict]) -> dict:
-    fallback_title = idea_text.strip()[:60] or "Untitled Idea"
-    result = {str(k).lower(): v for k, v in result.items()}
-
-    related_titles = _as_str_list(result.get("related_titles"))
-    valid_titles = {r["title"] for r in related}
-
+def _normalize_note(item: dict, fallback_title: str, linkable_titles: set) -> dict:
+    item = {str(k).lower(): v for k, v in item.items()}
+    links = _as_str_list(item.get("links"))
+    note_type = _as_str(item.get("type"), "concept").lower()
+    if note_type not in VALID_TYPES:
+        note_type = "concept"
     return {
-        "title": _as_str(result.get("title"), fallback_title)[:120],
-        "folder": _as_str(result.get("folder"), "Inbox"),
-        "tags": _as_str_list(result.get("tags")),
-        "body": _as_str(result.get("body"), idea_text.strip()),
-        "related_titles": [t for t in related_titles if t in valid_titles],
+        "action": "create",
+        "title": _as_str(item.get("title"), fallback_title)[:120],
+        "type": note_type,
+        "tags": _as_str_list(item.get("tags")),
+        "body": _as_str(item.get("body"), fallback_title),
+        "links": [t for t in links if t in linkable_titles],
     }
 
 
-def classify_idea(idea_text: str, existing_folders: list[str], related: list[dict]) -> dict:
+def _one_duplicate_vote(capture_text: str, candidates: list[dict], candidate_titles: set) -> str | None:
+    try:
+        result = _call_duplicate_check(capture_text, candidates)
+        if not isinstance(result, dict):
+            return None
+        target = _as_str(result.get("duplicate_of"), "")
+        return target if target in candidate_titles else None
+    except Exception:
+        return None
+
+
+def _check_duplicate(capture_text: str, candidates: list[dict], votes: int = 3) -> str | None:
+    """Returns the exact title of a genuine duplicate candidate, or None.
+
+    Measured directly: a single call to the local model missed an exact-match
+    duplicate about half the time, and a 2-of-3 MAJORITY vote made this worse
+    (1/8 caught, not better), which means the model's true per-call "yes"
+    rate is well under 50% -- a systematic bias toward "no", not noise around
+    a coin flip. Majority voting compounds an under-triggering bias; the
+    correct fix is an OR-ensemble (any positive vote counts), which gives the
+    "yes" branch multiple independent chances to fire. Confirmed empirically
+    before shipping (see scratchpad/dup_reliability.py results). Both
+    outcomes are non-destructive by design -- a duplicate never edits or
+    deletes anything, it only logs and links -- so biasing toward catching
+    duplicates over precision is the right tradeoff here.
+    """
+    if not candidates:
+        return None
+    candidate_titles = {c["title"] for c in candidates}
+    for _ in range(votes):
+        vote = _one_duplicate_vote(capture_text, candidates, candidate_titles)
+        if vote:
+            return vote
+    return None
+
+
+def _atomize(capture_text: str, candidates: list[dict]) -> list[dict]:
+    candidate_titles = {c["title"] for c in candidates}
+    fallback_title = capture_text.strip()[:60] or "Untitled"
+
     for _ in range(2):
         try:
-            result = _call_ollama(idea_text, existing_folders, related)
+            result = _call_atomize(capture_text, candidates)
             if not isinstance(result, dict):
                 continue
-            return _normalize(result, idea_text, related)
+            result = {str(k).lower(): v for k, v in result.items()}
+            raw_notes = result.get("notes")
+            if not isinstance(raw_notes, list) or not raw_notes:
+                continue
+
+            # Per-note fallback titles must be unique even when several sibling
+            # notes are all missing a title: two notes sharing a fallback would
+            # collide to the same filename (unique_path() disambiguates that
+            # fine), but Obsidian resolves [[links]] by filename, not display
+            # text, so a link meant for the second note would silently resolve
+            # to the first instead. Index-suffix each fallback when needed.
+            fallbacks = [
+                fallback_title if len(raw_notes) == 1 else f"{fallback_title} ({i + 1})"
+                for i in range(len(raw_notes))
+            ]
+            sibling_titles = {
+                _as_str(n.get("title"), fb)[:120] for n, fb in zip(raw_notes, fallbacks)
+            }
+            linkable = candidate_titles | sibling_titles
+            notes = [
+                _normalize_note(n, fb, linkable) for n, fb in zip(raw_notes, fallbacks)
+            ]
+            if notes:
+                return notes
         except Exception:
-            # Any failure here (bad JSON, non-dict response, connection drop) should
-            # degrade to the Inbox fallback below, never crash the caller.
             continue
 
-    return {
-        "title": idea_text.strip()[:60] or "Untitled Idea",
-        "folder": "Inbox",
-        "tags": ["unsorted"],
-        "body": idea_text.strip(),
-        "related_titles": [],
-    }
+    return [{
+        "action": "create", "title": fallback_title, "type": "concept",
+        "tags": ["unsorted"], "body": capture_text.strip(), "links": [],
+    }]
+
+
+def process_capture(capture_text: str, candidates: list[dict]) -> list[dict]:
+    """Returns a list of items, each either
+    {"action": "create", "title", "type", "tags", "body", "links"} or
+    {"action": "duplicate", "duplicate_of", "note"}.
+    Never raises -- falls back to a single safe "create" item in the "concept"
+    type on any failure (bad JSON, connection drop, malformed response)."""
+    duplicate_of = _check_duplicate(capture_text, candidates)
+    if duplicate_of:
+        return [{"action": "duplicate", "duplicate_of": duplicate_of, "note": ""}]
+    return _atomize(capture_text, candidates)
