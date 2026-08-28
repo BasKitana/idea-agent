@@ -15,6 +15,33 @@ VALID_TYPES = set(config.FOLDER_BY_TYPE.keys())
 # candidates is a much more reliable task for a local model than a rare
 # branch inside a richer generation schema.
 
+META_COMMAND_SYSTEM_PROMPT = """You judge whether input to a note-filing tool is genuine
+content worth recording, or an instruction directed at the TOOL ITSELF -- telling it to
+create/edit/delete/organize/manage its own notes, files, or folders.
+
+The critical distinction: is this about THIS TOOL'S OWN VAULT/FILES (an instruction), or about
+literally anything else the user wants to build, do, learn, or remember in the real world
+(content)? A capture describing a software project, app, or system the user wants to build is
+ALWAYS content, even when phrased with "build"/"make"/"create" -- those verbs alone do NOT
+mean it's an instruction. Only classify as an instruction when the ACTION is explicitly aimed
+at the tool's own notes/files/folders/vault, not at some other project or system.
+
+Examples of instructions (is_instruction: true) -- all explicitly about the tool's own notes/files:
+"Make me a file that links to another file." "Edit that note and add X." "Delete the old
+notes." "Create an empty folder [in the vault]." "Organize my vault." "Make a project folder
+with no notes inside [the vault]."
+
+Examples of genuine content (is_instruction: false) -- these describe projects/ideas to build
+or remember, NOT the tool's own files, even though they use "build"/"make"/"create":
+"I want to build a RAG pipeline using ChromaDB." "Build an app that tracks water intake."
+"A research project where I collect data from a GitHub repository." "Create a marketing plan
+for the launch." "Vercel's edge functions look good for the auth layer." "Remember to follow
+up with Sarah about Clerk."
+
+Respond with ONLY a JSON object:
+{"is_instruction": true or false}
+"""
+
 DUPLICATE_SYSTEM_PROMPT = """You judge whether a new capture is the SAME IDEA as one of a list
 of existing notes. This is a strict equivalence check, not a topic/relevance check.
 
@@ -83,6 +110,17 @@ def _vague_guard(capture_text: str) -> str:
     return ""
 
 
+def _call_meta_check(capture_text: str) -> dict:
+    response = ollama.chat(
+        model=config.OLLAMA_MODEL, format="json",
+        messages=[
+            {"role": "system", "content": META_COMMAND_SYSTEM_PROMPT},
+            {"role": "user", "content": capture_text},
+        ],
+    )
+    return json.loads(response["message"]["content"])
+
+
 def _call_duplicate_check(capture_text: str, candidates: list[dict]) -> dict:
     prompt = f"Existing notes:\n{_format_candidates(candidates)}\n\nNew capture:\n{capture_text}"
     response = ollama.chat(
@@ -141,6 +179,20 @@ def _normalize_note(item: dict, fallback_title: str, linkable_titles: set) -> di
         "body": _as_str(item.get("body"), fallback_title),
         "links": [t for t in links if t in linkable_titles],
     }
+
+
+def _is_meta_command(capture_text: str) -> bool:
+    """True if the capture is an instruction directed at the tool (create,
+    edit, delete, organize) rather than genuine content to record. Fails
+    open toward "not an instruction" -- an LLM error should never silently
+    swallow real content the user typed."""
+    try:
+        result = _call_meta_check(capture_text)
+        if not isinstance(result, dict):
+            return False
+        return bool(result.get("is_instruction", False))
+    except Exception:
+        return False
 
 
 def _one_duplicate_vote(capture_text: str, candidates: list[dict], candidate_titles: set) -> str | None:
@@ -222,11 +274,18 @@ def _atomize(capture_text: str, candidates: list[dict]) -> list[dict]:
 
 
 def process_capture(capture_text: str, candidates: list[dict]) -> list[dict]:
-    """Returns a list of items, each either
-    {"action": "create", "title", "type", "tags", "body", "links"} or
-    {"action": "duplicate", "duplicate_of", "note"}.
+    """Returns a list of items, each one of:
+    {"action": "create", "title", "type", "tags", "body", "links"},
+    {"action": "duplicate", "duplicate_of", "note"}, or
+    {"action": "not_content"} -- the capture was an instruction directed at
+    the tool itself (create/edit/delete/organize its own files), not
+    something to file. Caught live: "make me a file that..." and "edit that
+    file and add..." were both filed as nonsense notes about themselves
+    before this check existed.
     Never raises -- falls back to a single safe "create" item in the "concept"
     type on any failure (bad JSON, connection drop, malformed response)."""
+    if _is_meta_command(capture_text):
+        return [{"action": "not_content"}]
     duplicate_of = _check_duplicate(capture_text, candidates)
     if duplicate_of:
         return [{"action": "duplicate", "duplicate_of": duplicate_of, "note": ""}]

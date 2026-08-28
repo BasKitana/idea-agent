@@ -29,23 +29,82 @@ def atomize_response(notes):
     return chat_returning({"notes": notes})
 
 
+def not_instruction_response():
+    return chat_returning({"is_instruction": False})
+
+
+def instruction_response():
+    return chat_returning({"is_instruction": True})
+
+
+# process_capture() now always runs the meta-command check first. `return_value`
+# mocks (a single response reused for every call) are naturally safe -- none of
+# dup_response/no_dup_response/atomize_response include an "is_instruction" key,
+# so the meta-check reads it as absent/False and proceeds normally. Any test
+# using a `side_effect` LIST must account for this extra leading call, or the
+# whole sequence shifts by one and later assertions fail for the wrong reason.
+
+
+class TestMetaCommandDetection:
+    def test_instruction_short_circuits_before_any_other_call(self, mocker):
+        spy = mocker.patch.object(agent.ollama, "chat", return_value=instruction_response())
+        result = agent.process_capture("Make me a file that links to another file.", CANDIDATES)
+        assert result == [{"action": "not_content"}]
+        assert spy.call_count == 1  # neither duplicate-check nor atomize ever ran
+
+    def test_non_instruction_proceeds_to_normal_pipeline(self, mocker):
+        mocker.patch.object(agent.ollama, "chat", side_effect=[
+            not_instruction_response(),
+            atomize_response([{"title": "X", "type": "concept", "tags": [], "body": "b", "links": []}]),
+        ])
+        result = agent.process_capture("a real idea", [])
+        assert result[0]["action"] == "create"
+        assert result[0]["title"] == "X"
+
+    def test_meta_check_exception_fails_open(self, mocker):
+        mocker.patch.object(agent.ollama, "chat", side_effect=[
+            Exception("boom"),
+            atomize_response([{"title": "X", "type": "concept", "tags": [], "body": "b", "links": []}]),
+        ])
+        result = agent.process_capture("a real idea", [])
+        assert result[0]["action"] == "create"
+
+    def test_malformed_meta_check_response_fails_open(self, mocker):
+        mocker.patch.object(agent.ollama, "chat", side_effect=[
+            chat_returning("not json"),
+            atomize_response([{"title": "X", "type": "concept", "tags": [], "body": "b", "links": []}]),
+        ])
+        result = agent.process_capture("a real idea", [])
+        assert result[0]["action"] == "create"
+
+    def test_missing_is_instruction_key_defaults_to_false(self, mocker):
+        mocker.patch.object(agent.ollama, "chat", side_effect=[
+            chat_returning({}),
+            atomize_response([{"title": "X", "type": "concept", "tags": [], "body": "b", "links": []}]),
+        ])
+        result = agent.process_capture("a real idea", [])
+        assert result[0]["action"] == "create"
+
+
 class TestDuplicateDetection:
     def test_no_candidates_skips_duplicate_check_entirely(self, mocker):
         spy = mocker.patch.object(agent.ollama, "chat", return_value=atomize_response(
             [{"title": "X", "type": "concept", "tags": [], "body": "b", "links": []}]))
         agent.process_capture("idea with no candidates", [])
-        # Only the atomize call should have happened -- no wasted duplicate-check call.
-        assert spy.call_count == 1
+        # Meta-check (1) + atomize (1) -- duplicate-check adds nothing since
+        # there are no candidates to compare against.
+        assert spy.call_count == 2
 
     def test_first_vote_duplicate_short_circuits_atomize(self, mocker):
         spy = mocker.patch.object(agent.ollama, "chat", return_value=dup_response("Existing Note"))
         result = agent.process_capture("idea", CANDIDATES)
         assert result == [{"action": "duplicate", "duplicate_of": "Existing Note", "note": ""}]
-        assert spy.call_count == 1  # atomize never called
+        assert spy.call_count == 2  # meta-check (1) + first duplicate vote (1); atomize never called
 
     def test_or_ensemble_catches_a_late_positive_vote(self, mocker):
         # First two votes say "no", third says "yes" -- OR-ensemble must still catch it.
         mocker.patch.object(agent.ollama, "chat", side_effect=[
+            not_instruction_response(),
             no_dup_response(), no_dup_response(), dup_response("Existing Note"),
         ])
         result = agent.process_capture("idea", CANDIDATES)
@@ -54,6 +113,7 @@ class TestDuplicateDetection:
 
     def test_all_votes_no_falls_through_to_atomize(self, mocker):
         mocker.patch.object(agent.ollama, "chat", side_effect=[
+            not_instruction_response(),
             no_dup_response(), no_dup_response(), no_dup_response(),
             atomize_response([{"title": "New", "type": "concept", "tags": [], "body": "b", "links": []}]),
         ])
@@ -65,6 +125,7 @@ class TestDuplicateDetection:
         # Model names a candidate that was never actually offered -- must not
         # be trusted, and must not crash; falls through to atomize.
         mocker.patch.object(agent.ollama, "chat", side_effect=[
+            not_instruction_response(),
             dup_response("Some Note That Was Never A Candidate"),
             dup_response("Also Not Real"),
             dup_response("Still Not Real"),
@@ -75,6 +136,7 @@ class TestDuplicateDetection:
 
     def test_duplicate_check_exception_treated_as_no_and_does_not_crash(self, mocker):
         mocker.patch.object(agent.ollama, "chat", side_effect=[
+            not_instruction_response(),
             Exception("boom"), Exception("boom"), Exception("boom"),
             atomize_response([{"title": "New", "type": "concept", "tags": [], "body": "b", "links": []}]),
         ])
@@ -102,6 +164,7 @@ class TestAtomize:
 
     def test_link_to_retrieved_candidate_survives(self, mocker):
         mocker.patch.object(agent.ollama, "chat", side_effect=[
+            not_instruction_response(),
             no_dup_response(), no_dup_response(), no_dup_response(),
             atomize_response([{"title": "New", "type": "concept", "tags": [],
                                 "body": "b", "links": ["Existing Note"]}]),
@@ -149,6 +212,7 @@ class TestAtomize:
 
     def test_empty_notes_list_retries_then_falls_back(self, mocker):
         mocker.patch.object(agent.ollama, "chat", side_effect=[
+            not_instruction_response(),
             atomize_response([]), atomize_response([]),
         ])
         result = agent.process_capture("my capture", [])
@@ -166,6 +230,7 @@ class TestAtomize:
 
     def test_connection_error_then_success_recovers(self, mocker):
         mocker.patch.object(agent.ollama, "chat", side_effect=[
+            not_instruction_response(),
             ConnectionError("down"),
             atomize_response([{"title": "X", "type": "concept", "tags": [], "body": "b", "links": []}]),
         ])

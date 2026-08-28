@@ -44,6 +44,7 @@ def process_capture(capture_text: str, index: RagIndex):
     created = []       # (title, path, links)
     duplicates = []    # (capture_text, existing_title)
     failed = []        # (title_or_desc, error)
+    not_content = False
 
     for item in items:
         try:
@@ -61,6 +62,8 @@ def process_capture(capture_text: str, index: RagIndex):
                 created.append((item["title"], path, item["type"]))
             elif item["action"] == "duplicate":
                 duplicates.append((capture_text, item["duplicate_of"]))
+            elif item["action"] == "not_content":
+                not_content = True
         except Exception as e:
             failed.append((item.get("title") or item.get("duplicate_of") or "?", e))
 
@@ -69,10 +72,10 @@ def process_capture(capture_text: str, index: RagIndex):
             config.VAULT_PATH, [t for t, _, _ in created], duplicates,
         )
 
-    _print_summary(created, duplicates, failed)
+    _print_summary(created, duplicates, failed, not_content)
 
 
-def _print_summary(created, duplicates, failed):
+def _print_summary(created, duplicates, failed, not_content=False):
     # Titles/paths/errors are LLM-generated or user-supplied text and may
     # contain literal [brackets] -- console.print() treats those as markup
     # tags, so unescaped dynamic text can be silently mangled or dropped
@@ -87,6 +90,11 @@ def _print_summary(created, duplicates, failed):
                       f"[[{escape(existing)}]]")
     for desc, err in failed:
         lines.append(f"[bold red]x {escape(str(desc))}: {escape(str(err))}[/bold red]")
+    if not_content:
+        lines.append("[dim]That reads like an instruction, not something to file -- this "
+                      "tool only ever captures and files new notes. It can't create empty "
+                      "folders, edit or delete existing notes, or manage files. Type an "
+                      "idea, thought, or fact instead.[/dim]")
 
     if not lines:
         console.print("[dim]Nothing came of that.[/dim]")

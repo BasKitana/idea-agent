@@ -72,6 +72,16 @@ class TestProcessCapture:
         main.process_capture("some idea", index)
         assert (vault_path / "01_Concepts" / "New Note.md").exists()
 
+    def test_not_content_item_writes_nothing_and_explains(self, mocker, vault_path):
+        index = RagIndex()
+        mocker.patch.object(agent, "process_capture", return_value=[{"action": "not_content"}])
+        with main.console.capture() as capture:
+            main.process_capture("Make me a file that links to another file.", index)
+        output = capture.get()
+        assert "instruction" in output
+        assert not (vault_path / "01_Concepts").exists()
+        assert not (vault_path / "02_Projects").exists()
+
     def test_duplicate_item_writes_no_note_but_logs(self, mocker, vault_path):
         index = RagIndex()
         mocker.patch.object(agent, "process_capture", return_value=[
