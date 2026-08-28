@@ -38,3 +38,14 @@ DEDUP_TOP_K = int(os.environ.get("DEDUP_TOP_K", "8"))
 # observed inventing 4-5 fictional sub-topics when asked to atomize vague
 # one-line input instead of just capturing it as-is.
 ATOMIZE_MIN_WORDS = int(os.environ.get("ATOMIZE_MIN_WORDS", "12"))
+
+# A candidate scoring at or above this is auto-linked regardless of whether
+# the LLM's own "links" field mentioned it. Measured directly: given a
+# clearly-related candidate right there in the prompt, the model only
+# populated "links" in 4/6 runs -- it forgets, the same unreliability pattern
+# as the earlier duplicate-detection bug. Since the retrieval score is known
+# before the LLM even runs, don't depend on it remembering; this is a floor
+# under the LLM's own judgment, not a replacement for it. 0.50 sits below the
+# real related-note case measured (0.585) with margin above the noise band
+# (0.038-0.456) from earlier calibration.
+AUTO_LINK_SCORE = float(os.environ.get("AUTO_LINK_SCORE", "0.50"))

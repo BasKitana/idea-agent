@@ -144,6 +144,61 @@ class TestDuplicateDetection:
         assert result[0]["action"] == "create"
 
 
+class TestAutoLink:
+    """Measured directly: given a strongly-related candidate right there in
+    the prompt, the model only populated "links" in 4/6 runs -- it forgets,
+    the same unreliability pattern as duplicate-detection. Since the
+    retrieval score is already known before the LLM runs, auto-link anything
+    at/above AUTO_LINK_SCORE regardless of what the LLM decided."""
+
+    def test_high_score_candidate_gets_linked_even_if_llm_omits_it(self, mocker):
+        candidates = [{"title": "Existing Note", "type": "project", "score": 0.90, "excerpt": "x"}]
+        mocker.patch.object(agent.ollama, "chat", side_effect=[
+            not_instruction_response(),
+            no_dup_response(), no_dup_response(), no_dup_response(),
+            atomize_response([{"title": "New", "type": "concept", "tags": [], "body": "b", "links": []}]),
+        ])
+        result = agent.process_capture("idea", candidates)
+        assert "Existing Note" in result[0]["links"]
+
+    def test_low_score_candidate_is_not_auto_linked(self, mocker):
+        candidates = [{"title": "Existing Note", "type": "project", "score": 0.10, "excerpt": "x"}]
+        mocker.patch.object(agent.ollama, "chat", side_effect=[
+            not_instruction_response(),
+            no_dup_response(), no_dup_response(), no_dup_response(),
+            atomize_response([{"title": "New", "type": "concept", "tags": [], "body": "b", "links": []}]),
+        ])
+        result = agent.process_capture("idea", candidates)
+        assert result[0]["links"] == []
+
+    def test_auto_link_merges_without_duplicating_llms_own_link(self, mocker):
+        candidates = [{"title": "Existing Note", "type": "project", "score": 0.90, "excerpt": "x"}]
+        mocker.patch.object(agent.ollama, "chat", side_effect=[
+            not_instruction_response(),
+            no_dup_response(), no_dup_response(), no_dup_response(),
+            atomize_response([{"title": "New", "type": "concept", "tags": [], "body": "b",
+                                "links": ["Existing Note"]}]),
+        ])
+        result = agent.process_capture("idea", candidates)
+        assert result[0]["links"].count("Existing Note") == 1
+
+    def test_auto_link_scoped_to_single_note_batches(self, mocker):
+        # A multi-note split doesn't cleanly tell us which resulting note a
+        # whole-capture-level retrieval score actually belongs to, so it's
+        # scoped off rather than linking every sibling note indiscriminately.
+        candidates = [{"title": "Existing Note", "type": "project", "score": 0.90, "excerpt": "x"}]
+        mocker.patch.object(agent.ollama, "chat", side_effect=[
+            not_instruction_response(),
+            no_dup_response(), no_dup_response(), no_dup_response(),
+            atomize_response([
+                {"title": "Note A", "type": "project", "tags": [], "body": "b1", "links": []},
+                {"title": "Note B", "type": "concept", "tags": [], "body": "b2", "links": []},
+            ]),
+        ])
+        result = agent.process_capture("compound idea", candidates)
+        assert all("Existing Note" not in item["links"] for item in result)
+
+
 class TestAtomize:
     def test_single_concept_produces_one_note(self, mocker):
         mocker.patch.object(agent.ollama, "chat", return_value=atomize_response(

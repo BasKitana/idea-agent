@@ -262,6 +262,17 @@ def _atomize(capture_text: str, candidates: list[dict]) -> list[dict]:
             notes = [
                 _normalize_note(n, fb, linkable) for n, fb in zip(raw_notes, fallbacks)
             ]
+            # Don't depend on the LLM to remember a strongly-related candidate:
+            # measured directly, given one right there in the prompt, it only
+            # populated "links" in 4/6 runs. The retrieval score is already
+            # known before this call even runs, so auto-link anything strong
+            # regardless of what the LLM did -- a floor under its judgment,
+            # not a replacement. Scoped to the single-note case: a multi-note
+            # split doesn't cleanly tell us which resulting note a
+            # whole-capture-level score actually belongs to.
+            if len(notes) == 1:
+                strong = [c["title"] for c in candidates if c.get("score", 0) >= config.AUTO_LINK_SCORE]
+                notes[0]["links"] = list(dict.fromkeys(notes[0]["links"] + strong))
             if notes:
                 return notes
         except Exception:
