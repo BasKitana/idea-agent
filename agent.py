@@ -119,19 +119,45 @@ candidate is genuinely the same idea, duplicate_of is null.
 """
 
 APPEND_SYSTEM_PROMPT = """You judge whether a new capture should be APPENDED as an update to
-one specific existing note, rather than becoming its own separate new note.
+one specific existing note, rather than becoming its own separate new note. This tool acts as a
+clerk that consolidates related material into as few files as possible -- not a note-taker that
+gives every new fact its own page.
 
-Answer append=true only when the capture is a small new fact, detail, capability, or status
-update specifically about that SAME existing note's subject -- it just extends what's already
-there and does not need its own page.
+Answer append=true whenever the capture is genuinely ABOUT that SAME existing note's subject AND
+adds information the note doesn't already have -- a new fact, detail, capability, decision, or
+status update. Default to append=true for same-subject content even when it's substantial; do
+not withhold it just because there's a lot to say. Size alone is never a reason to say no.
 
-Answer append=false when the capture describes something substantial enough to deserve its
-own note even though it's related: a distinct sub-project, a genuinely separate concept, a
-specific event/log entry, or anything with enough content to stand alone (link it to the
-existing note instead of merging into it).
+Answer append=false when either of these is true:
+- The capture is clearly about a DIFFERENT, standalone subject that doesn't belong under this
+  note at all -- a genuinely separate project, a distinct general concept not specific to this
+  note's subject, or a one-off event/log entry.
+- The capture doesn't add anything new -- it's just restating or rewording a fact the note
+  already covers (a duplicate, not an update). Do not append a redundant restatement of
+  something already in the note just because it's about the same subject.
+
+When genuinely uncertain whether it's the same subject and genuinely new information, prefer
+append=true.
 
 Respond with ONLY a JSON object:
 {"append": true or false}
+"""
+
+REDUNDANT_UPDATE_SYSTEM_PROMPT = """You judge whether a new capture is REDUNDANT with an
+existing note it's about to be appended to -- i.e. it restates a fact the note already states,
+in different words, without adding anything new.
+
+Answer redundant=true ONLY when the capture and the note's existing content are clearly saying
+the exact same fact, just reworded (e.g. an acronym spelled out, a synonym swapped in) -- no new
+detail, number, decision, or capability beyond what the note already says.
+
+Answer redundant=false whenever the capture adds ANY new detail, fact, decision, capability, or
+status the note doesn't already have -- even if it also restates something already there
+alongside the new part. When genuinely uncertain whether it's truly redundant or actually adds
+something new, answer redundant=false.
+
+Respond with ONLY a JSON object:
+{"redundant": true or false}
 """
 
 ATOMIZE_SYSTEM_PROMPT = """You decompose a raw capture into atomic notes for a technical
@@ -151,12 +177,17 @@ NOTE TYPES (choose exactly one per note):
   moment in time. Not every mention of a project is a log entry; only use log when the capture
   describes an event occurring, not a fact/feature/detail about the project itself.
 
-ATOMICITY:
-- If the capture describes ONE distinct concept, produce exactly ONE note. Do not invent
-  additional notes that aren't actually in the input.
-- If the capture genuinely contains multiple distinct concepts (e.g. a project plus a specific
-  technology choice plus something to learn), split into multiple atomic notes, one per
-  concept, and link them to each other via "links".
+ATOMICITY (bias toward FEWER notes -- this tool acts as a clerk consolidating related material,
+not a note-taker giving every fact its own page):
+- If the capture describes ONE distinct subject, produce exactly ONE note, even if that subject
+  has several facts, details, or sub-points -- put them all in that one note's body rather than
+  splitting each point into its own note. A project's tech choices, features, and status are
+  all part of that ONE project's note, not separate notes.
+- Only split into multiple notes when the capture genuinely covers two or more SEPARATE
+  subjects that don't share one overarching topic (e.g. a project update AND an unrelated
+  reminder about a person, or two different projects mentioned in passing) -- one note per
+  actual subject, linked to each other. Do not split just because a subject has multiple
+  parts; split only when there are multiple, actually-different subjects.
 - If the capture is vague, short, or a placeholder with no real distinguishable topic, produce
   exactly ONE note that captures it as-is. NEVER fabricate sub-topics, structure, or
   elaboration not actually present in the input. Inventing content the user didn't say is a
@@ -308,6 +339,21 @@ def _call_append_check(capture_text: str, candidate: dict, session_history: list
     return json.loads(response["message"]["content"])
 
 
+def _call_redundant_check(capture_text: str, target: dict, session_history: list[dict] = None) -> dict:
+    prompt = (
+        f'Existing note: "{target["title"]}": {target.get("excerpt", "")}\n'
+        f'{_format_session_history(session_history)}\nNew capture:\n{capture_text}'
+    )
+    response = ollama.chat(
+        model=config.OLLAMA_MODEL, format="json",
+        messages=[
+            {"role": "system", "content": REDUNDANT_UPDATE_SYSTEM_PROMPT},
+            {"role": "user", "content": prompt},
+        ],
+    )
+    return json.loads(response["message"]["content"])
+
+
 def _call_duplicate_check(capture_text: str, candidates: list[dict], session_history: list[dict] = None) -> dict:
     prompt = (
         f"Existing notes:\n{_format_candidates(candidates)}\n"
@@ -452,6 +498,32 @@ def _one_append_vote(capture_text: str, candidate: dict, session_history: list[d
         return isinstance(result, dict) and bool(result.get("append", False))
     except Exception:
         return False
+
+
+def _one_redundant_vote(capture_text: str, target: dict, session_history: list[dict]) -> bool:
+    try:
+        result = _call_redundant_check(capture_text, target, session_history)
+        return isinstance(result, dict) and bool(result.get("redundant", False))
+    except Exception:
+        return False
+
+
+def _is_redundant_update(capture_text: str, target: dict, session_history: list[dict],
+                          votes: int = 3) -> bool:
+    """True only if EVERY vote agrees the capture adds nothing beyond what
+    the target note already says. Unanimous, not OR -- the opposite bias
+    from duplicate-detection, because this decides whether to SUPPRESS
+    content rather than whether to flag it. A missed redundant line just
+    means one repeated sentence gets appended (minor, easily fixed by hand);
+    wrongly calling real new information "redundant" silently drops it
+    forever, which is worse. Needs its own focused call rather than folding
+    "is this new information" into the append-decision prompt -- measured
+    directly: bolting that question onto APPEND_SYSTEM_PROMPT still let an
+    obvious reworded restatement ("RAG note filing tool" -> "retrieval-
+    augmented generation tool that files notes") through as a fresh append,
+    the same "combined judgment degrades reliability" failure this codebase
+    already hit once with duplicate-detection-plus-generation."""
+    return all(_one_redundant_vote(capture_text, target, session_history) for _ in range(votes))
 
 
 def _check_append(capture_text: str, candidates: list[dict],
@@ -648,6 +720,16 @@ def process_capture(capture_text: str, candidates: list[dict], known_notes: list
         return [{"action": "duplicate", "duplicate_of": duplicate_of, "note": ""}]
     append_target = _check_append(capture_text, candidates, session_history)
     if append_target:
+        # A restated near-duplicate of the target note's own content can
+        # slip past _check_duplicate (measured live: reworded technical
+        # phrasing missed 3/3 duplicate votes) and, once append is scoped to
+        # "same subject" rather than "small update", would otherwise get
+        # written into the note as if it were new -- silently polluting it
+        # with a repeated fact. Catch that here as a duplicate instead of an
+        # append: no new file (same outcome as before), and no redundant
+        # line added to the existing note either.
+        if _is_redundant_update(capture_text, append_target, session_history):
+            return [{"action": "duplicate", "duplicate_of": append_target["title"], "note": ""}]
         return [{
             "action": "append", "target_path": append_target["path"],
             "target_title": append_target["title"], "text": capture_text.strip(),

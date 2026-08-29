@@ -67,6 +67,22 @@ def append_response():
     return chat_returning({"append": True})
 
 
+def redundant_response():
+    return chat_returning({"redundant": True})
+
+
+def no_redundant_response():
+    return chat_returning({"redundant": False})
+
+
+# process_capture() also runs a redundant-update check (up to 3 UNANIMOUS
+# votes) whenever the append-check actually wins -- i.e. any test where an
+# "append" action is the final expected result. all() short-circuits on the
+# first falsy vote, so a single no_redundant_response() is enough to make the
+# append win; only a test that specifically wants the redundant-suppression
+# path to fire needs 3 redundant_response() items.
+
+
 # process_capture() also runs an append-check (up to 3 OR-ensemble votes,
 # same shape as duplicate-check) whenever candidates contain exactly one
 # entry at/above AUTO_LINK_SCORE -- i.e. every test using CANDIDATES (score
@@ -456,6 +472,7 @@ class TestAppendToExisting:
             not_instruction_response(),
             no_dup_response(), no_dup_response(), no_dup_response(),
             append_response(),
+            no_redundant_response(),
         ])
         result = agent.process_capture("Existing Note now does X too", self.STRONG)
         assert result == [{
@@ -505,8 +522,49 @@ class TestAppendToExisting:
             not_instruction_response(),
             no_dup_response(), no_dup_response(), no_dup_response(),
             no_append_response(), no_append_response(), append_response(),
+            no_redundant_response(),
         ])
         result = agent.process_capture("idea", self.STRONG)
+        assert result[0]["action"] == "append"
+
+    def test_redundant_update_is_treated_as_duplicate_not_appended(self, mocker):
+        """Reported live: broadening append to merge substantial same-subject
+        content also let a reworded restatement of an existing fact through
+        as if it were new -- polluting the note with a repeated line. A
+        dedicated, unanimous redundant-check catches it and downgrades to a
+        duplicate outcome (log + link, no write) instead."""
+        mocker.patch.object(agent.ollama, "chat", side_effect=[
+            not_instruction_response(),
+            no_dup_response(), no_dup_response(), no_dup_response(),
+            append_response(),
+            redundant_response(), redundant_response(), redundant_response(),
+        ])
+        result = agent.process_capture("Existing Note, reworded", self.STRONG)
+        assert result == [{"action": "duplicate", "duplicate_of": "Existing Note", "note": ""}]
+
+    def test_single_non_redundant_vote_is_enough_to_keep_the_append(self, mocker):
+        # Unanimous means ALL votes must agree it's redundant to suppress --
+        # a single dissenting vote (even after two "redundant" votes) must
+        # let the append through, the opposite bias from duplicate-detection.
+        mocker.patch.object(agent.ollama, "chat", side_effect=[
+            not_instruction_response(),
+            no_dup_response(), no_dup_response(), no_dup_response(),
+            append_response(),
+            redundant_response(), redundant_response(), no_redundant_response(),
+        ])
+        result = agent.process_capture("Existing Note now does X too", self.STRONG)
+        assert result[0]["action"] == "append"
+
+    def test_redundant_check_exception_fails_open_to_append(self, mocker):
+        # Same fail-open direction as the append-check itself: an error
+        # judging redundancy must not silently drop real content.
+        mocker.patch.object(agent.ollama, "chat", side_effect=[
+            not_instruction_response(),
+            no_dup_response(), no_dup_response(), no_dup_response(),
+            append_response(),
+            Exception("boom"),
+        ])
+        result = agent.process_capture("Existing Note now does X too", self.STRONG)
         assert result[0]["action"] == "append"
 
     def test_append_check_exception_fails_open_to_atomize(self, mocker):

@@ -46,6 +46,36 @@ of that measurement, not out of guessing:
   fuzzy or semantic matching.** Delete and link only ever act on a title the model copied
   verbatim from the vault's real note list; case/hyphen/spacing differences are normalized
   away, but a name that doesn't resolve to a real note is refused, not guessed at.
+- **Fewer files by default: the tool behaves like a clerk consolidating related material, not
+  a note-taker giving every fact its own page.** Two mechanisms drive this. Atomization now
+  keeps every fact/detail/sub-point about ONE subject in that subject's single note, splitting
+  into separate notes only when a capture genuinely covers multiple, actually-different
+  subjects -- not just multiple parts of the same one. And the append check now defaults to
+  merging same-subject content into the existing note regardless of size (previously it only
+  merged "small" updates and pushed anything substantial into its own new, related-but-separate
+  file) -- it only refuses to merge when the new content is clearly about a different,
+  standalone subject. Measured live across 6 trials of a multi-fact same-subject capture: 5/6
+  correctly consolidated into a single note (previously this would have split every time by
+  design); the one miss still produced exactly one file, just via two atomized notes instead of
+  one.
+- **Broadening append to merge substantial content introduced a new failure mode, caught by
+  testing the change rather than assuming it was safe.** Once append no longer required a "small"
+  update, a reworded restatement of a fact the note already had (missed by duplicate-detection,
+  a pre-existing, already-documented imperfection) started getting appended as if it were new --
+  polluting the note with a repeated line instead of just spawning an extra file. Bolting an
+  "is this actually new information" clause onto the append-decision prompt itself did not
+  reliably catch it (measured: an obvious acronym-expansion restatement, "RAG" to "retrieval-
+  augmented generation", got through 0 times fixed by that alone). The actual fix followed this
+  codebase's own established rule -- split into its own focused, single-question call rather
+  than combining judgments -- as a dedicated, UNANIMOUS-vote "is this redundant with the note
+  it's about to join" check that runs right before an append executes; a redundant verdict
+  downgrades the outcome to a duplicate (logged and linked, nothing written) instead of an
+  append. Unanimous, not OR, because suppressing real new content is the costly mistake here
+  (same direction as delete-confirm and instruction-detection), the opposite of duplicate-
+  detection's OR-ensemble. This closed the common case (verified live) but not a specific
+  acronym-expansion phrasing, which is a systematic model bias rather than per-call noise --
+  measured 0/8 across repeated trials, so more voting rounds cannot fix it; documented here as a
+  known residual limitation rather than claimed as solved.
 - **Session memory fixes retrieval, not just judgment -- carrying the prior turn's subject
   forward as a candidate, not just adding conversation text to the prompt.** Feeding recent
   turns into the LLM's prompts alone fixed pronoun resolution for commands ("delete it" against
@@ -140,7 +170,7 @@ pip install -r requirements-dev.txt
 pytest
 ```
 
-230 tests, no live Ollama server or network access required -- the embedding model and
+233 tests, no live Ollama server or network access required -- the embedding model and
 `ollama.chat` are mocked/faked for speed and determinism.
 
 ## Configuration
