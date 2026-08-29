@@ -97,6 +97,41 @@ class TestSessionMemoryAccumulation:
         titles = [c["title"] for c in seen_candidates["candidates"]]
         assert "Idea Agent" in titles
 
+    def test_subject_carry_forward_does_not_override_an_already_strong_candidate(self, mocker, vault_path):
+        # Reported live against the real vault: capture N-1 created a new
+        # note ("love-for-idea-agent"); capture N ("idea agent can now be a
+        # clerk of my notes", no pronoun at all) genuinely retrieved OTHER,
+        # actually-relevant notes, but injecting the prior subject
+        # unconditionally added a synthetic AUTO_LINK_SCORE candidate that
+        # won the "single strong candidate" slot instead, so the fact got
+        # appended to the wrong (just-created, unrelated) note. The injected
+        # subject must never be added once a real candidate already clears
+        # AUTO_LINK_SCORE on its own.
+        index = RagIndex()
+        mocker.patch.object(agent, "process_capture", return_value=[
+            {"action": "create", "title": "love-for-idea-agent", "type": "concept",
+             "tags": [], "body": "b", "links": []},
+        ])
+        session_history = []
+        main.process_capture("I love the idea agent", index, session_history)
+        assert session_history[-1]["subject"] == "love-for-idea-agent"
+
+        seen_candidates = {}
+
+        def fake_process_capture(capture_text, candidates, known_notes, history):
+            seen_candidates["candidates"] = candidates
+            return [{"action": "not_content"}]
+
+        mocker.patch.object(agent, "process_capture", side_effect=fake_process_capture)
+        genuinely_relevant = [{"title": "idea-agent-project-smart", "path": "x.md",
+                                "type": "project", "score": config.AUTO_LINK_SCORE, "excerpt": "x"}]
+        mocker.patch.object(index, "query", return_value=genuinely_relevant)
+        main.process_capture("idea agent can now be a clerk of my notes", index, session_history)
+
+        titles = [c["title"] for c in seen_candidates["candidates"]]
+        assert "love-for-idea-agent" not in titles
+        assert titles == ["idea-agent-project-smart"]
+
     def test_repl_passes_growing_history_into_agent_calls(self, mocker, ready_ollama, vault_path):
         # call_args_list stores a REFERENCE to the (mutated-in-place) history
         # list, not a snapshot -- inspecting it after main() returns would

@@ -58,7 +58,16 @@ def process_capture(capture_text: str, index: RagIndex, session_history: list[di
     # Reported live. Carry the previous turn's subject note forward as a
     # guaranteed strong candidate so continuity doesn't depend on embedding
     # luck for a pronoun that carries almost no semantic content of its own.
-    if session_history:
+    #
+    # Only do this when nothing already qualifies as strongly related on its
+    # own merits -- otherwise this can steal the append/link target away from
+    # a genuinely relevant note. Reported live against the real vault: "idea
+    # agent can now be a clerk of my notes" (no pronoun at all) got appended
+    # to the just-created "love-for-idea-agent" note -- forced to exactly
+    # AUTO_LINK_SCORE -- instead of either actual Idea Agent project note,
+    # because injecting unconditionally let a synthetic score beat two real
+    # candidates that individually scored just under the bar.
+    if session_history and not any(c.get("score", 0) >= config.AUTO_LINK_SCORE for c in candidates):
         subject_title = session_history[-1].get("subject")
         if subject_title and not any(c["title"] == subject_title for c in candidates):
             subject_note = next((n for n in known_notes if n["title"] == subject_title), None)
