@@ -1,19 +1,30 @@
 # Knowledge Agent
 
-A local terminal agent that turns raw captures (ideas, thoughts, meeting notes) into a
-structured Obsidian vault, automatically -- and that you can also directly command to manage
-that vault (link, update, delete specific existing notes by name).
+**The goal: capture your ideas and keep them ordered, without losing them along the way.**
 
-Type a capture into the REPL. The agent checks whether you've already written about it, checks
-whether it's really just a small update to something you already have, splits it into distinct
-atomic notes if it covers more than one concept, classifies each into one of four types, and
-files it with proper frontmatter and links -- all locally, no API keys. Naming an exact
-existing note in an instruction ("delete X", "link X to Y") gets executed if unambiguous;
-vague vault instructions ("clean up my vault") are refused rather than guessed at.
+Two ways ideas get lost. You don't write them down, because filing them properly is friction
+in the moment. Or you do write them down, and they dissolve into a pile of near-duplicate,
+disconnected files you'll never find again. This tool exists to remove both -- you type the
+idea and stop thinking about it; it decides where the idea belongs in your Obsidian vault and
+puts it there, connected to what you already know.
+
+It works like a clerk, not a note-taker: fewer files, better placed. A new idea about something
+you've already written gets merged into that existing note instead of becoming file number
+four on the same subject. A genuinely new idea gets its own note, classified, tagged, and
+linked to the related things it came from. Nothing is silently dropped, and nothing is
+overwritten -- updates are additive, deletes go to the Recycle Bin, and anything too ambiguous
+to place safely is handed back to you rather than guessed at.
+
+Type a capture into the REPL and it checks whether you've already written about it, whether
+it's really an update to something you have, whether it covers more than one distinct subject,
+classifies each note into one of four types, and files it with proper frontmatter and links.
+You can also just tell it what to do -- "delete X", "link X to Y", "delete all my logs" --
+and it executes when the target is unambiguous, asks first when the action is destructive, and
+refuses when the instruction is too vague to act on safely.
 
 Everything runs on-device: the LLM is a local [Ollama](https://ollama.com) model, embeddings
 are a local `sentence-transformers` model, and the retrieval index is a plain JSON file. No
-data leaves your machine.
+API keys, no accounts, no data leaving your machine.
 
 ## Design
 

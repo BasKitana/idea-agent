@@ -18,7 +18,9 @@ HELP_TEXT = """[bold]Commands[/bold]
   /help          show this message
   /list          show recently filed notes
   /quit, /exit   exit
-Anything else you type is captured, atomized, and filed. Naming an exact existing note
+Type an idea and forget about it -- it gets placed where it belongs, merged into an
+existing note when it's really about something you've already written, given its own
+note when it isn't. Naming an exact existing note
 ("delete X", "link X to Y") is executed if unambiguous, as is an all-scoped delete
 ("delete all notes", "delete all my logs") after you confirm it. Vague instructions
 ("delete the old ones", "clean up") are refused rather than guessed at."""
@@ -297,7 +299,8 @@ def main():
         sys.exit(1)
 
     console.print(Panel(
-        f"Vault: {config.VAULT_PATH}\nModel: {config.OLLAMA_MODEL}",
+        "[dim]Capture your ideas and keep them ordered, without losing them along the way.[/dim]\n"
+        f"\nVault: {config.VAULT_PATH}\nModel: {config.OLLAMA_MODEL}",
         title="Knowledge Agent", border_style="cyan",
     ))
 
