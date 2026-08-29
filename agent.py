@@ -610,11 +610,11 @@ def _atomize(capture_text: str, candidates: list[dict], session_history: list[di
                 continue
 
             # Per-note fallback titles must be unique even when several sibling
-            # notes are all missing a title: two notes sharing a fallback would
-            # collide to the same filename (unique_path() disambiguates that
-            # fine), but Obsidian resolves [[links]] by filename, not display
-            # text, so a link meant for the second note would silently resolve
-            # to the first instead. Index-suffix each fallback when needed.
+            # notes are all missing a title. Two notes sharing a fallback share
+            # a filename, and filenames are now the identity of a note: the
+            # second would be merged into the first rather than written as its
+            # own file, silently collapsing two distinct concepts into one.
+            # Index-suffix each fallback when needed.
             fallbacks = [
                 fallback_title if len(raw_notes) == 1 else f"{fallback_title} ({i + 1})"
                 for i in range(len(raw_notes))

@@ -1,3 +1,5 @@
+import os
+
 import pytest
 
 import config
@@ -82,24 +84,54 @@ class TestSlugify:
         assert vault.slugify(text) == text
 
 
-class TestUniquePath:
-    def test_no_collision_returns_bare_slug(self, tmp_path):
-        assert vault.unique_path(tmp_path, "Foo").name == "Foo.md"
+class TestNoDuplicateFilenames:
+    """A filename may never be taken twice. Reported directly: the old
+    numeric-suffix disambiguation produced an "Idea Agent Project" /
+    "Idea Agent Project (2)" pair -- one subject split across two files,
+    with the twin unreachable by [[wikilink]] since Obsidian resolves those
+    by filename."""
 
-    def test_collision_sequence(self, tmp_path):
-        (tmp_path / "Foo.md").touch()
-        (tmp_path / "Foo (2).md").touch()
-        (tmp_path / "Foo (3).md").touch()
-        assert vault.unique_path(tmp_path, "Foo").name == "Foo (4).md"
+    def test_no_existing_note_found_in_empty_vault(self, tmp_path):
+        assert vault.find_existing_note(tmp_path, "Foo") is None
 
-    def test_gap_in_sequence_fills_the_gap(self, tmp_path):
-        (tmp_path / "Foo (2).md").touch()
-        assert vault.unique_path(tmp_path, "Foo").name == "Foo.md"
+    def test_finds_an_existing_note_in_its_type_folder(self, tmp_path):
+        vault.write_note(tmp_path, "concept", "Foo", [], "body", [])
+        found = vault.find_existing_note(tmp_path, "Foo")
+        assert found is not None and found.name == "Foo.md"
 
-    def test_case_insensitive_collision_on_windows(self, tmp_path):
-        (tmp_path / "My Idea.md").touch()
-        result = vault.unique_path(tmp_path, "my idea")
-        assert result.name != "my idea.md"
+    def test_finds_a_same_filename_note_in_a_different_folder(self, tmp_path):
+        # Obsidian resolves [[Foo]] by filename vault-wide, so a concept Foo
+        # and a project Foo are one ambiguous target, not two notes.
+        vault.write_note(tmp_path, "concept", "Foo", [], "body", [])
+        found = vault.find_existing_note(tmp_path, "Foo")
+        assert found.parent.name == "01_Concepts"
+
+    def test_second_write_merges_instead_of_creating_a_numbered_twin(self, tmp_path):
+        first = vault.write_note(tmp_path, "project", "Idea Agent Project", [], "original body", [])
+        second = vault.write_note(tmp_path, "project", "Idea Agent Project", [], "a new fact", [])
+        assert second == first
+        assert not (tmp_path / "02_Projects" / "Idea Agent Project (2).md").exists()
+        assert len(list((tmp_path / "02_Projects").glob("*.md"))) == 1
+
+    def test_merged_write_keeps_the_original_body_and_adds_the_new_one(self, tmp_path):
+        vault.write_note(tmp_path, "project", "Foo", [], "original body", [])
+        path = vault.write_note(tmp_path, "project", "Foo", [], "a new fact", [])
+        text = path.read_text(encoding="utf-8")
+        assert "original body" in text  # never overwritten
+        assert "a new fact" in text
+        assert "## Updates" in text
+
+    def test_merge_happens_even_across_different_types(self, tmp_path):
+        vault.write_note(tmp_path, "concept", "Foo", [], "original body", [])
+        path = vault.write_note(tmp_path, "project", "Foo", [], "a new fact", [])
+        assert path.parent.name == "01_Concepts"  # merged into the existing one
+        assert not (tmp_path / "02_Projects" / "Foo.md").exists()
+
+    @pytest.mark.skipif(os.name != "nt", reason="depends on a case-insensitive filesystem")
+    def test_case_differing_title_merges_on_windows(self, tmp_path):
+        vault.write_note(tmp_path, "concept", "My Idea", [], "original body", [])
+        vault.write_note(tmp_path, "concept", "my idea", [], "a new fact", [])
+        assert len(list((tmp_path / "01_Concepts").glob("*.md"))) == 1
 
 
 class TestWriteNote:

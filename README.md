@@ -11,9 +11,10 @@ puts it there, connected to what you already know.
 It works like a clerk, not a note-taker: fewer files, better placed. A new idea about something
 you've already written gets merged into that existing note instead of becoming file number
 four on the same subject. A genuinely new idea gets its own note, classified, tagged, and
-linked to the related things it came from. Nothing is silently dropped, and nothing is
-overwritten -- updates are additive, deletes go to the Recycle Bin, and anything too ambiguous
-to place safely is handed back to you rather than guessed at.
+linked to the related things it came from. No two notes ever share a filename -- a title that's
+already taken merges into the note holding it rather than spawning an "X (2)" twin. Nothing is
+silently dropped, and nothing is overwritten -- updates are additive, deletes go to the Recycle
+Bin, and anything too ambiguous to place safely is handed back to you rather than guessed at.
 
 Type a capture into the REPL and it checks whether you've already written about it, whether
 it's really an update to something you have, whether it covers more than one distinct subject,
@@ -86,6 +87,17 @@ of that measurement, not out of guessing:
   fuzzy or semantic matching.** Delete and link only ever act on a title the model copied
   verbatim from the vault's real note list; case/hyphen/spacing differences are normalized
   away, but a name that doesn't resolve to a real note is refused, not guessed at.
+- **A filename can never be taken twice, and that one is guaranteed by code rather than by
+  model judgment.** Everything else here about consolidation is the LLM exercising judgment,
+  which means it is reliable-but-not-certain. This one isn't a judgment at all: `write_note`
+  merges into whatever note already holds a filename instead of creating a second file beside
+  it. The earlier numeric-suffix disambiguation is what produced the reported "Idea Agent
+  Project" / "Idea Agent Project (2)" pair -- and the suffixed twin was unreachable by
+  `[[wikilink]]` anyway, since Obsidian resolves those by filename, so it was a file you could
+  neither find nor link to. The check is vault-wide rather than per-folder for the same reason:
+  a concept `Foo.md` and a project `Foo.md` are not two notes, they're one ambiguous link
+  target. Merging is also the non-destructive outcome -- the existing note's content is never
+  overwritten, the new material is appended under `## Updates`.
 - **Fewer files by default: the tool behaves like a clerk consolidating related material, not
   a note-taker giving every fact its own page.** Two mechanisms drive this. Atomization now
   keeps every fact/detail/sub-point about ONE subject in that subject's single note, splitting
@@ -227,7 +239,7 @@ pip install -r requirements-dev.txt
 pytest
 ```
 
-256 tests, no live Ollama server or network access required -- the embedding model and
+260 tests, no live Ollama server or network access required -- the embedding model and
 `ollama.chat` are mocked/faked for speed and determinism.
 
 ## Configuration

@@ -3,6 +3,7 @@ import pytest
 import agent
 import config
 import main
+import vault
 from rag import RagIndex
 
 
@@ -267,6 +268,27 @@ class TestProcessCapture:
         main.process_capture("delete Old Note", index)
 
         assert "01_Concepts/Old Note.md" not in index.data
+
+    def test_create_colliding_with_an_existing_note_merges_and_reports_updated(self, mocker, vault_path):
+        # No "X (2).md" twin, and the summary must say "updated", not
+        # "created" -- reporting a merge as a creation would misdescribe the
+        # vault and put the wrong subject into session memory.
+        vault.write_note(vault_path, "project", "Idea Agent Project", [], "original body", [])
+        index = RagIndex()
+        mocker.patch.object(agent, "process_capture", return_value=[{
+            "action": "create", "title": "Idea Agent Project", "type": "project",
+            "tags": [], "body": "a new fact", "links": [],
+        }])
+        session_history = []
+        with main.console.capture() as captured:
+            main.process_capture("idea agent is now smart", index, session_history)
+
+        out = captured.get()
+        assert "~ updated" in out
+        assert "+ Idea Agent Project" not in out
+        assert not (vault_path / "02_Projects" / "Idea Agent Project (2).md").exists()
+        assert len(list((vault_path / "02_Projects").glob("*.md"))) == 1
+        assert "updated 'Idea Agent Project'" in session_history[-1]["summary"]
 
     def _bulk_delete_vault(self, vault_path, mocker):
         """Two real notes on disk + in the index, ready to be bulk-deleted."""

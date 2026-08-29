@@ -128,16 +128,28 @@ def process_capture(capture_text: str, index: RagIndex, session_history: list[di
         try:
             if item["action"] == "create":
                 links = list(dict.fromkeys(item["links"] + [today]))  # anti-orphan: always link today's log
+                # write_note merges into whatever note already holds this
+                # filename instead of creating an "X (2).md" twin. Ask first
+                # so the summary reports what actually happened -- claiming
+                # "+ created" for a merge would be a lie about the vault.
+                merged_into = vault.find_existing_note(config.VAULT_PATH, item["title"])
                 path = vault.write_note(
                     config.VAULT_PATH, item["type"], item["title"],
                     item["tags"], item["body"], links,
                 )
                 try:
-                    index.add(path, item["title"], f"{item['title']}\n{item['body']}", note_type=item["type"])
+                    if merged_into:
+                        index.add(path, item["title"], path.read_text(encoding="utf-8"))
+                    else:
+                        index.add(path, item["title"], f"{item['title']}\n{item['body']}",
+                                   note_type=item["type"])
                 except Exception:
                     console.print(f"[yellow]Filed '{item['title']}', but the RAG index update "
                                   "failed -- it'll resync next launch.[/yellow]")
-                created.append((item["title"], path, item["type"]))
+                if merged_into:
+                    updated.append((capture_text, item["title"]))
+                else:
+                    created.append((item["title"], path, item["type"]))
             elif item["action"] == "append":
                 path = vault.append_update(config.VAULT_PATH, item["target_path"], item["text"])
                 try:

@@ -783,9 +783,9 @@ class TestAtomize:
         assert result[0]["links"] == ["Existing Note"]
 
     def test_multiple_notes_missing_titles_get_distinct_fallbacks(self, mocker):
-        # Both notes omit "title" -- if they collapsed to the same fallback,
-        # unique_path() would still avoid a file overwrite, but a link meant
-        # for the second note would resolve (by filename) to the first.
+        # Both notes omit "title" -- if they collapsed to the same fallback
+        # they'd share a filename, and the second would be merged into the
+        # first instead of becoming its own note.
         mocker.patch.object(agent.ollama, "chat", return_value=atomize_response([
             {"type": "concept", "tags": [], "body": "b1", "links": []},
             {"type": "concept", "tags": [], "body": "b2", "links": []},

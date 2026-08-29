@@ -53,13 +53,22 @@ def slugify(text: str, default: str = "Untitled") -> str:
     return slug
 
 
-def unique_path(folder: Path, slug: str) -> Path:
-    candidate = folder / f"{slug}.md"
-    n = 2
-    while candidate.exists():
-        candidate = folder / f"{slug} ({n}).md"
-        n += 1
-    return candidate
+def find_existing_note(vault_path: Path, title: str) -> Path | None:
+    """The note already occupying this title's filename, anywhere in the
+    vault, or None.
+
+    Deliberately vault-wide rather than per-folder: Obsidian resolves
+    [[wikilinks]] by filename across the entire vault, so two "X.md" files in
+    different type folders aren't two notes -- they're one ambiguous link
+    target, and which one a link opens is not something the writer controls.
+    A title collision across folders is therefore just as broken as one
+    within a folder."""
+    filename = f"{slugify(title)}.md"
+    for folder in config.FOLDER_BY_TYPE.values():
+        candidate = vault_path / folder / filename
+        if candidate.exists():
+            return candidate
+    return None
 
 
 def _yaml_quote(s: str) -> str:
@@ -107,6 +116,20 @@ def _links_section(heading: str, links: list[str]) -> str:
 
 def write_note(vault_path: Path, note_type: str, title: str, tags: list[str],
                 body: str, links: list[str], related_heading: str = "Related") -> Path:
+    """Create the note, or merge into the one already holding that filename.
+
+    Never produces "X (2).md". An earlier version disambiguated collisions
+    with a numeric suffix, which is what produced the reported
+    "Idea Agent Project" / "Idea Agent Project (2)" pair: two files with the
+    same title are not two notes, they're one subject split in half, and the
+    suffixed twin is unreachable by [[wikilink]] anyway since Obsidian
+    resolves those by filename. Merging is both the safe outcome (nothing is
+    overwritten -- append_update only inserts) and the one the rest of this
+    tool is built around."""
+    existing = find_existing_note(vault_path, title)
+    if existing:
+        return append_update(vault_path, existing.relative_to(vault_path).as_posix(), body)
+
     folder_name = config.FOLDER_BY_TYPE.get(note_type, config.FOLDER_BY_TYPE["log"])
     folder_path = vault_path / folder_name
     folder_path.mkdir(parents=True, exist_ok=True)
@@ -119,7 +142,7 @@ def write_note(vault_path: Path, note_type: str, title: str, tags: list[str],
         + _links_section(related_heading, links)
     )
 
-    path = unique_path(folder_path, slugify(title))
+    path = folder_path / f"{slugify(title)}.md"
     path.write_text(content, encoding="utf-8")
     return path
 
