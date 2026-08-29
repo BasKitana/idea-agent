@@ -66,9 +66,21 @@ note titles -- this is the complete list; no other notes exist.
 
 Only produce "delete" or "link" when the instruction unambiguously names note(s) from that
 EXACT list. Copy the title(s) verbatim from the list -- never invent, guess, abbreviate, or
-partially match a title. If the instruction is vague ("delete the old notes", "clean up",
-"organize my vault"), names something not in the list, or could plausibly mean more than one
-note, respond "unclear" -- do not guess which note(s) it means.
+partially match a title. If the instruction names something not in the list, or could plausibly
+mean more than one note without covering ALL of them, respond "unclear" -- do not guess which
+note(s) it means.
+
+Produce "delete_all" when the instruction clearly means EVERY note, or every note of one type,
+rather than any specific one -- "delete all notes", "delete everything", "delete all that is
+here", "wipe the vault", "clear it all out", "delete all my logs". This is a real, answerable
+instruction, NOT an unclear one: "all" is precise about scope even though it names no title.
+Set "note_type" to "concept", "project", "entity", or "log" when the instruction limits itself
+to one of those kinds ("delete all my logs" -> "log"); set it to null when it means everything.
+
+Still respond "unclear" for scope words that are genuinely fuzzy about WHICH notes rather than
+meaning all of them -- "delete the old notes", "delete the useless ones", "clean up", "organize
+my vault", "delete the duplicates". Those describe a judgment call you cannot verify; "all" does
+not.
 
 You may be given recent conversation from this session. If the instruction uses "it"/"that"/
 "the one I just mentioned" and the recent conversation clearly identifies exactly one specific
@@ -78,6 +90,7 @@ note, treat it as unclear rather than guessing.
 
 Respond with ONLY a JSON object, one of:
 {"action": "delete", "target": str}
+{"action": "delete_all", "note_type": str or null}
 {"action": "link", "source": str, "target": str}
 {"action": "unclear"}
 """
@@ -681,6 +694,22 @@ def _parse_command(capture_text: str, known_notes: list[dict],
                 return None
             return {"action": "delete", "target_path": target["path"], "target_title": target["title"]}
 
+        if action == "delete_all":
+            # Deliberately NOT gated behind _confirm_delete's LLM vote: an
+            # unverifiable model opinion is the wrong guard for an operation
+            # whose scope is already unambiguous. The caller prompts the
+            # human with the exact file list instead -- a real confirmation
+            # from the person whose vault it is beats three model votes.
+            note_type = _as_str(result.get("note_type"), "").lower()
+            note_type = note_type if note_type in VALID_TYPES else None
+            targets = [
+                n for n in known_notes
+                if note_type is None or n.get("type", "concept") == note_type
+            ]
+            if not targets:
+                return None
+            return {"action": "delete_all", "note_type": note_type, "targets": targets}
+
         if action == "link":
             source = _find_by_title(_as_str(result.get("source"), ""), known_notes)
             target = _find_by_title(_as_str(result.get("target"), ""), known_notes)
@@ -705,7 +734,12 @@ def process_capture(capture_text: str, candidates: list[dict], known_notes: list
     ("Idea Agent Project", "...- Smart Feature", "...(2)") accumulated from
     captures that were really just new facts about the same project.
     {"action": "duplicate", "duplicate_of", "note"},
-    {"action": "delete", "target_path", "target_title"} or
+    {"action": "delete", "target_path", "target_title"},
+    {"action": "delete_all", "note_type", "targets"} -- every note, or every
+    note of one type. Unlike single-note delete this is NOT gated on an LLM
+    confirmation vote: its scope is already unambiguous, so there's nothing
+    for a model to verify; the caller prompts the human with the real file
+    list instead. Or
     {"action": "link", "source_path", "source_title", "target_path", "target_title"}
     -- an unambiguous, confirmed vault-management instruction, or
     {"action": "not_content"} -- the capture was an instruction, but too

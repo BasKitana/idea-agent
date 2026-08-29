@@ -268,6 +268,60 @@ class TestProcessCapture:
 
         assert "01_Concepts/Old Note.md" not in index.data
 
+    def _bulk_delete_vault(self, vault_path, mocker):
+        """Two real notes on disk + in the index, ready to be bulk-deleted."""
+        (vault_path / "01_Concepts").mkdir(parents=True)
+        (vault_path / "04_Logs").mkdir(parents=True)
+        (vault_path / "01_Concepts" / "A.md").write_text("# A\n", encoding="utf-8")
+        (vault_path / "04_Logs" / "B.md").write_text("# B\n", encoding="utf-8")
+        index = RagIndex()
+        index.data["01_Concepts/A.md"] = {"mtime": 1, "title": "A", "type": "concept", "embedding": [0]}
+        index.data["04_Logs/B.md"] = {"mtime": 1, "title": "B", "type": "log", "embedding": [0]}
+        targets = [
+            {"title": "A", "path": "01_Concepts/A.md", "type": "concept"},
+            {"title": "B", "path": "04_Logs/B.md", "type": "log"},
+        ]
+        mocker.patch.object(agent, "process_capture", return_value=[{
+            "action": "delete_all", "note_type": None, "targets": targets,
+        }])
+        mocker.patch("vault.send2trash.send2trash")  # never touch the real recycle bin in tests
+        return index
+
+    def test_bulk_delete_removes_every_target_when_confirmed(self, mocker, vault_path):
+        index = self._bulk_delete_vault(vault_path, mocker)
+        main.process_capture("delete all notes", index, confirm=lambda targets, note_type: True)
+        assert index.data == {}
+
+    def test_bulk_delete_deletes_nothing_when_declined(self, mocker, vault_path):
+        # The human prompt is the ONLY guard on this path (no LLM vote), so
+        # "no" has to mean nothing is touched at all.
+        index = self._bulk_delete_vault(vault_path, mocker)
+        main.process_capture("delete all notes", index, confirm=lambda targets, note_type: False)
+        assert set(index.data) == {"01_Concepts/A.md", "04_Logs/B.md"}
+
+    def test_bulk_delete_confirm_receives_the_real_target_list(self, mocker, vault_path):
+        # The prompt shows the person what they're about to lose -- if it were
+        # handed the wrong list the confirmation would be meaningless.
+        index = self._bulk_delete_vault(vault_path, mocker)
+        seen = {}
+
+        def fake_confirm(targets, note_type):
+            seen["titles"] = [t["title"] for t in targets]
+            seen["note_type"] = note_type
+            return False
+
+        main.process_capture("delete all notes", index, confirm=fake_confirm)
+        assert seen["titles"] == ["A", "B"]
+        assert seen["note_type"] is None
+
+    def test_bulk_delete_one_failure_does_not_abort_the_rest(self, mocker, vault_path):
+        index = self._bulk_delete_vault(vault_path, mocker)
+        mocker.patch.object(main.vault, "delete_note", side_effect=[OSError("locked"), None])
+        main.process_capture("delete all notes", index, confirm=lambda targets, note_type: True)
+        # First failed, second still got deleted and de-indexed.
+        assert "01_Concepts/A.md" in index.data
+        assert "04_Logs/B.md" not in index.data
+
     def test_link_item_adds_wikilink_and_reindexes_source(self, mocker, vault_path):
         target = vault_path / "01_Concepts"
         target.mkdir(parents=True)
@@ -367,6 +421,23 @@ class TestRichMarkupSafety:
         with main.console.capture() as capture:
             main.process_capture("idea", index)
         assert "[urgent] Fix the bug" in capture.get()
+
+    @pytest.mark.parametrize("title", ["love-for-idea-agent", "Idea-Agent", "#tagged", "@mention"])
+    def test_wikilink_titles_survive_rich_markup(self, title):
+        # Rich's tag regex matches any [...] opening with a lowercase letter,
+        # #, / or @ -- so escaping only the title left the literal brackets to
+        # be parsed, and [[love-for-idea-agent]] printed as an empty "[]".
+        # Capitalized fixture titles hid this in every existing test.
+        rendered = main._wikilink(title)
+        with main.console.capture() as capture:
+            main.console.print(rendered)
+        assert f"[[{title}]]" in capture.get()
+
+    def test_deleted_lowercase_title_is_not_swallowed_in_summary(self, mocker, vault_path):
+        index = RagIndex()
+        with main.console.capture() as capture:
+            main._print_summary([], [], [], deleted=["love-for-idea-agent"])
+        assert "love-for-idea-agent" in capture.get()
 
     def test_bracketed_title_prints_literally_in_list_recent(self, vault_path):
         index = RagIndex()

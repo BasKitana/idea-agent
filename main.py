@@ -19,8 +19,9 @@ HELP_TEXT = """[bold]Commands[/bold]
   /list          show recently filed notes
   /quit, /exit   exit
 Anything else you type is captured, atomized, and filed. Naming an exact existing note
-("delete X", "link X to Y") is executed if unambiguous; vague vault instructions are
-refused rather than guessed at."""
+("delete X", "link X to Y") is executed if unambiguous, as is an all-scoped delete
+("delete all notes", "delete all my logs") after you confirm it. Vague instructions
+("delete the old ones", "clean up") are refused rather than guessed at."""
 
 
 def check_ollama() -> str | None:
@@ -36,13 +37,44 @@ def check_ollama() -> str | None:
     return None
 
 
-def process_capture(capture_text: str, index: RagIndex, session_history: list[dict] = None) -> None:
+def confirm_bulk_delete(targets: list[dict], note_type: str | None) -> bool:
+    """Real human confirmation for a whole-vault (or whole-type) delete.
+
+    Every other destructive path in this tool is guarded by LLM votes, which
+    is right when the question is "did I identify the correct single note".
+    It's the wrong guard here: "delete all" is already unambiguous about
+    scope, so there's nothing for a model to verify -- the only meaningful
+    check is the person whose vault it is seeing the actual file list and
+    saying yes. Requires typing "yes" in full, not "y": the whole point is
+    that this shouldn't be a reflex keystroke."""
+    scope = f"all {note_type} notes" if note_type else "EVERY note in the vault"
+    console.print(f"\n[bold red]About to delete {escape(scope)} "
+                  f"-- {len(targets)} file(s):[/bold red]")
+    for n in targets[:20]:
+        console.print(f"  [dim]-[/dim] {escape(n['title'])} [dim]({escape(n['path'])})[/dim]")
+    if len(targets) > 20:
+        console.print(f"  [dim]... and {len(targets) - 20} more[/dim]")
+    console.print("[dim]All of these go to the Recycle Bin, so they stay recoverable.[/dim]")
+    try:
+        answer = console.input('[bold]Type "yes" to confirm: [/bold]').strip().lower()
+    except (EOFError, KeyboardInterrupt):
+        return False
+    return answer == "yes"
+
+
+def process_capture(capture_text: str, index: RagIndex, session_history: list[dict] = None,
+                     confirm: callable = None) -> None:
     """session_history is mutated in place: this turn's outcome is appended
     and the list is capped at SESSION_MEMORY_SIZE, so the caller's list
     object reflects the growing short-term memory without needing to
-    reassign or unpack a return value."""
+    reassign or unpack a return value.
+
+    confirm is the human-confirmation hook for bulk deletes (injected so
+    tests can drive it); defaults to the real interactive prompt."""
     if session_history is None:
         session_history = []
+    if confirm is None:
+        confirm = confirm_bulk_delete
     candidates = index.query(
         capture_text, top_k=config.DEDUP_TOP_K, min_score=config.DEDUP_RETRIEVE_SCORE,
     )
@@ -74,7 +106,11 @@ def process_capture(capture_text: str, index: RagIndex, session_history: list[di
             if subject_note:
                 candidates = candidates + [{**subject_note, "score": config.AUTO_LINK_SCORE}]
 
-    items = agent.process_capture(capture_text, candidates, known_notes, session_history)
+    # Spinner lives here, around the LLM reasoning only -- execution below can
+    # need the console for a confirmation prompt, and a live status spinner
+    # fights with console.input() for the terminal.
+    with console.status("Thinking..."):
+        items = agent.process_capture(capture_text, candidates, known_notes, session_history)
 
     today = date.today().isoformat()
     created = []       # (title, path, links)
@@ -84,6 +120,7 @@ def process_capture(capture_text: str, index: RagIndex, session_history: list[di
     linked = []        # (source_title, target_title)
     failed = []        # (title_or_desc, error)
     not_content = False
+    cancelled = False  # bulk delete offered, human declined at the prompt
 
     for item in items:
         try:
@@ -112,6 +149,20 @@ def process_capture(capture_text: str, index: RagIndex, session_history: list[di
                 index.data.pop(item["target_path"], None)
                 index.save()
                 deleted.append(item["target_title"])
+            elif item["action"] == "delete_all":
+                if not confirm(item["targets"], item["note_type"]):
+                    cancelled = True
+                    continue
+                for target in item["targets"]:
+                    try:
+                        vault.delete_note(config.VAULT_PATH, target["path"])
+                        index.data.pop(target["path"], None)
+                        deleted.append(target["title"])
+                    except Exception as e:
+                        # One unreadable/already-gone file must not abort the
+                        # rest of the batch half-done.
+                        failed.append((target["title"], e))
+                index.save()
             elif item["action"] == "link":
                 path = vault.add_link(config.VAULT_PATH, item["source_path"], item["target_title"])
                 try:
@@ -132,7 +183,7 @@ def process_capture(capture_text: str, index: RagIndex, session_history: list[di
             config.VAULT_PATH, [t for t, _, _ in created], duplicates, updated,
         )
 
-    _print_summary(created, duplicates, failed, not_content, updated, deleted, linked)
+    _print_summary(created, duplicates, failed, not_content, updated, deleted, linked, cancelled)
     summary = _history_summary(created, duplicates, updated, deleted, linked, failed, not_content)
     subject = _history_subject(created, duplicates, updated, deleted, linked)
     session_history.append({"capture": capture_text[:100], "summary": summary, "subject": subject})
@@ -178,7 +229,21 @@ def _history_subject(created, duplicates, updated, deleted, linked) -> str | Non
     return None
 
 
-def _print_summary(created, duplicates, failed, not_content=False, updated=None, deleted=None, linked=None):
+def _wikilink(title: str) -> str:
+    """A [[wikilink]] safe to hand to console.print().
+
+    escape()-ing only the title is NOT enough: Rich parses the surrounding
+    literal brackets too, and its tag regex matches any [...] starting with a
+    lowercase letter, #, / or @. So [[Idea-Agent]] survived (capital I) while
+    [[love-for-idea-agent]] was swallowed whole, printing an empty "[]" --
+    caught by running a real bulk delete, not by the tests, since every
+    fixture title happened to start with a capital. Escape the brackets and
+    the title together."""
+    return escape(f"[[{title}]]")
+
+
+def _print_summary(created, duplicates, failed, not_content=False, updated=None, deleted=None,
+                    linked=None, cancelled=False):
     # Titles/paths/errors are LLM-generated or user-supplied text and may
     # contain literal [brackets] -- console.print() treats those as markup
     # tags, so unescaped dynamic text can be silently mangled or dropped
@@ -189,17 +254,19 @@ def _print_summary(created, duplicates, failed, not_content=False, updated=None,
         lines.append(f"[bold green]+ {escape(title)}[/bold green] "
                       f"[dim]({escape(note_type)} -> {escape(str(path))})[/dim]")
     for raw, target in (updated or []):
-        lines.append(f"[bold cyan]~ updated[/bold cyan] -> [[{escape(target)}]]")
+        lines.append(f"[bold cyan]~ updated[/bold cyan] -> {_wikilink(target)}")
     for source, target in (linked or []):
-        lines.append(f"[bold cyan]~ linked[/bold cyan] [[{escape(source)}]] -> [[{escape(target)}]]")
+        lines.append(f"[bold cyan]~ linked[/bold cyan] {_wikilink(source)} -> {_wikilink(target)}")
     for title in (deleted or []):
-        lines.append(f"[bold magenta]- deleted[/bold magenta] [[{escape(title)}]] "
+        lines.append(f"[bold magenta]- deleted[/bold magenta] {_wikilink(title)} "
                       f"[dim](sent to recycle bin)[/dim]")
     for raw, existing in duplicates:
         lines.append(f"[bold yellow]= already covered[/bold yellow] -> "
-                      f"[[{escape(existing)}]]")
+                      f"{_wikilink(existing)}")
     for desc, err in failed:
         lines.append(f"[bold red]x {escape(str(desc))}: {escape(str(err))}[/bold red]")
+    if cancelled:
+        lines.append("[dim]Cancelled -- nothing was deleted.[/dim]")
     if not_content:
         lines.append("[dim]That reads like an instruction I can't safely act on -- it either "
                       "wasn't specific about which existing note(s) it means, or it named "
@@ -270,8 +337,7 @@ def main():
             elif command == "/list":
                 list_recent(index)
             else:
-                with console.status("Thinking..."):
-                    process_capture(text, index, session_history)
+                process_capture(text, index, session_history)
         except (EOFError, KeyboardInterrupt):
             break
         except Exception as e:

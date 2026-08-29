@@ -49,6 +49,10 @@ def unclear_command_response():
     return chat_returning({"action": "unclear"})
 
 
+def delete_all_command_response(note_type=None):
+    return chat_returning({"action": "delete_all", "note_type": note_type})
+
+
 def confirm_response(confirmed):
     return chat_returning({"confirmed": confirmed})
 
@@ -340,6 +344,62 @@ class TestVaultCommands:
     re-confirmation on top of the initial parse -- the one operation here
     with no recovery path but the OS recycle bin, so it's deliberately
     biased toward refusing over guessing."""
+
+    def test_delete_all_returns_every_note_as_a_target(self, mocker):
+        # Reported live: "delete all that is here" and "delete all exsisting
+        # notes" were both correctly detected as instructions, then refused,
+        # because the command layer could only express "delete <one exact
+        # title>". "All" is precise about scope -- it just names no title.
+        mocker.patch.object(agent.ollama, "chat", side_effect=[
+            instruction_response(), instruction_response(), instruction_response(),
+            delete_all_command_response(),
+        ])
+        result = agent.process_capture("delete all existing notes", [], KNOWN_NOTES)
+        assert len(result) == 1
+        assert result[0]["action"] == "delete_all"
+        assert result[0]["note_type"] is None
+        assert result[0]["targets"] == KNOWN_NOTES
+
+    def test_delete_all_scoped_to_one_type_filters_targets(self, mocker):
+        typed = [
+            {"title": "A Log", "path": "04_Logs/A Log.md", "type": "log"},
+            {"title": "A Concept", "path": "01_Concepts/A Concept.md", "type": "concept"},
+        ]
+        mocker.patch.object(agent.ollama, "chat", side_effect=[
+            instruction_response(), instruction_response(), instruction_response(),
+            delete_all_command_response("log"),
+        ])
+        result = agent.process_capture("delete all my logs", [], typed)
+        assert result[0]["note_type"] == "log"
+        assert [t["title"] for t in result[0]["targets"]] == ["A Log"]
+
+    def test_delete_all_needs_no_llm_confirmation_vote(self, mocker):
+        # Scope is unambiguous, so there's nothing for a model to verify --
+        # the human prompt in main.py is the real guard. Exactly 3 meta votes
+        # + 1 parse call, no confirm votes.
+        spy = mocker.patch.object(agent.ollama, "chat", side_effect=[
+            instruction_response(), instruction_response(), instruction_response(),
+            delete_all_command_response(),
+        ])
+        agent.process_capture("delete everything", [], KNOWN_NOTES)
+        assert spy.call_count == 4
+
+    def test_delete_all_on_empty_vault_is_refused(self, mocker):
+        mocker.patch.object(agent.ollama, "chat", side_effect=[
+            instruction_response(), instruction_response(), instruction_response(),
+            delete_all_command_response(),
+        ])
+        result = agent.process_capture("delete everything", [], [])
+        assert result == [{"action": "not_content"}]
+
+    def test_delete_all_with_bogus_note_type_falls_back_to_everything(self, mocker):
+        mocker.patch.object(agent.ollama, "chat", side_effect=[
+            instruction_response(), instruction_response(), instruction_response(),
+            delete_all_command_response("nonsense"),
+        ])
+        result = agent.process_capture("delete all the nonsense notes", [], KNOWN_NOTES)
+        assert result[0]["note_type"] is None
+        assert result[0]["targets"] == KNOWN_NOTES
 
     def test_delete_with_pronoun_resolved_by_session_history(self, mocker):
         # Reported live: "delete it" resolved correctly to the right note at

@@ -42,6 +42,16 @@ of that measurement, not out of guessing:
   exactly `01_Concepts/`, `02_Projects/`, `03_Entities/`, `04_Logs/`. This also closes off an
   entire bug class from an earlier free-folder version of this tool (path traversal via a
   malicious/malformed folder name, and everything defaulting to "Inbox").
+- **"All" is a precise scope, not a vague one -- and it gets a human confirmation, not an LLM
+  vote.** Reported live: "delete all that is here" and "delete all existing notes" were both
+  correctly recognized as instructions and then refused anyway, because the command layer could
+  only express "delete &lt;one exact title&gt;". Bulk delete now parses into its own action. It's
+  deliberately the one destructive path with no LLM confirmation vote: those votes exist to
+  check "did I identify the right single note", and an all-scoped delete has nothing of the
+  sort to verify -- so the guard is the person seeing the real file list and typing "yes" in
+  full. Genuinely fuzzy scopes ("delete the old notes", "clean up") are still refused, since
+  those describe a judgment call rather than a scope. Measured 21/21 across both phrasings,
+  type-scoped deletes, the vague controls, and single-title delete.
 - **Command targets must match a real existing title exactly (punctuation/case aside), never
   fuzzy or semantic matching.** Delete and link only ever act on a title the model copied
   verbatim from the vault's real note list; case/hyphen/spacing differences are normalized
@@ -170,6 +180,8 @@ to it) to launch the agent without touching a terminal.
 - Type an idea, thought, or fact to capture, atomize, and file it.
 - Name an existing note exactly to delete or link it ("delete X", "link X to Y") -- executed
   if unambiguous, refused with an explanation otherwise.
+- Delete in bulk ("delete all notes", "delete everything", "delete all my logs") -- prints the
+  exact file list and waits for you to type "yes" before touching anything.
 - `/list` -- show recently filed notes.
 - `/help` -- show the command list.
 - `/quit` / `/exit` -- exit.
@@ -181,7 +193,7 @@ pip install -r requirements-dev.txt
 pytest
 ```
 
-236 tests, no live Ollama server or network access required -- the embedding model and
+250 tests, no live Ollama server or network access required -- the embedding model and
 `ollama.chat` are mocked/faked for speed and determinism.
 
 ## Configuration
