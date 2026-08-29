@@ -76,6 +76,17 @@ of that measurement, not out of guessing:
   acronym-expansion phrasing, which is a systematic model bias rather than per-call noise --
   measured 0/8 across repeated trials, so more voting rounds cannot fix it; documented here as a
   known residual limitation rather than claimed as solved.
+- **The append decision needed the same architecture as duplicate-detection, not a score
+  pre-filter.** The first version of append-broadening still required exactly one candidate to
+  score >= AUTO_LINK_SCORE before it would even ask the LLM whether to append -- with 0 or 2+
+  candidates crossing that bar, the judgment call never ran at all, and reported live, this was
+  the common case, not the rare one: it looked like the tool "just kept adding files" regardless
+  of what was typed. Rebuilt to mirror `_check_duplicate` exactly -- every retrieved candidate
+  (no score gate) goes into one call that reads through all of them and picks which, if any, the
+  capture belongs with. Verified live against the exact real-vault sequence that used to split
+  ("the idea agent project now is smart" / "the idea agent now knows how to use Obsidian."): 3/3
+  trials now merge into one file, while a genuinely unrelated second capture in the same session
+  still correctly produces a separate note.
 - **Session memory fixes retrieval, not just judgment -- carrying the prior turn's subject
   forward as a candidate, not just adding conversation text to the prompt.** Feeding recent
   turns into the LLM's prompts alone fixed pronoun resolution for commands ("delete it" against
@@ -170,7 +181,7 @@ pip install -r requirements-dev.txt
 pytest
 ```
 
-233 tests, no live Ollama server or network access required -- the embedding model and
+236 tests, no live Ollama server or network access required -- the embedding model and
 `ollama.chat` are mocked/faked for speed and determinism.
 
 ## Configuration

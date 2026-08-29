@@ -118,29 +118,30 @@ If yes, duplicate_of is the matching candidate's EXACT title, copied verbatim. I
 candidate is genuinely the same idea, duplicate_of is null.
 """
 
-APPEND_SYSTEM_PROMPT = """You judge whether a new capture should be APPENDED as an update to
-one specific existing note, rather than becoming its own separate new note. This tool acts as a
+APPEND_SYSTEM_PROMPT = """You judge whether a new capture should be APPENDED as an update to ONE
+of a list of existing notes, rather than becoming its own separate new note. This tool acts as a
 clerk that consolidates related material into as few files as possible -- not a note-taker that
-gives every new fact its own page.
+gives every new fact its own page. Read through ALL the existing notes given below before
+deciding; the right match is not always the first or most obviously worded one.
 
-Answer append=true whenever the capture is genuinely ABOUT that SAME existing note's subject AND
-adds information the note doesn't already have -- a new fact, detail, capability, decision, or
-status update. Default to append=true for same-subject content even when it's substantial; do
-not withhold it just because there's a lot to say. Size alone is never a reason to say no.
+Answer with a note's EXACT title, copied verbatim, whenever the capture is genuinely ABOUT that
+note's SAME subject AND adds information the note doesn't already have -- a new fact, detail,
+capability, decision, or status update. Default to appending same-subject content even when it's
+substantial; do not withhold it just because there's a lot to say, and do not skip it just
+because more than one note is loosely related -- pick whichever ONE note the capture is most
+specifically about.
 
-Answer append=false when either of these is true:
-- The capture is clearly about a DIFFERENT, standalone subject that doesn't belong under this
-  note at all -- a genuinely separate project, a distinct general concept not specific to this
-  note's subject, or a one-off event/log entry.
-- The capture doesn't add anything new -- it's just restating or rewording a fact the note
-  already covers (a duplicate, not an update). Do not append a redundant restatement of
-  something already in the note just because it's about the same subject.
-
-When genuinely uncertain whether it's the same subject and genuinely new information, prefer
-append=true.
+Answer null when any of these is true:
+- No existing note shares the capture's subject -- it's a different, standalone topic that
+  deserves its own new note.
+- The capture doesn't add anything new to the best-matching note -- it's just restating or
+  rewording a fact that note already covers (a duplicate, not an update).
+- More than one note is a plausible, comparably strong match and it's genuinely unclear which
+  one this belongs to (uncommon -- most captures have one clearly best-fitting note even among
+  several related ones).
 
 Respond with ONLY a JSON object:
-{"append": true or false}
+{"append_to": str or null}
 """
 
 REDUNDANT_UPDATE_SYSTEM_PROMPT = """You judge whether a new capture is REDUNDANT with an
@@ -323,11 +324,10 @@ def _call_delete_confirm(capture_text: str, target: dict, session_history: list[
     return json.loads(response["message"]["content"])
 
 
-def _call_append_check(capture_text: str, candidate: dict, session_history: list[dict] = None) -> dict:
+def _call_append_check(capture_text: str, candidates: list[dict], session_history: list[dict] = None) -> dict:
     prompt = (
-        f'Existing note: "{candidate["title"]}" (type: {candidate.get("type", "concept")}): '
-        f'{candidate.get("excerpt", "")}\n'
-        f'{_format_session_history(session_history)}\nNew capture:\n{capture_text}'
+        f"Existing notes:\n{_format_candidates(candidates)}\n"
+        f"{_format_session_history(session_history)}\nNew capture:\n{capture_text}"
     )
     response = ollama.chat(
         model=config.OLLAMA_MODEL, format="json",
@@ -492,12 +492,16 @@ def _check_duplicate(capture_text: str, candidates: list[dict],
     return None
 
 
-def _one_append_vote(capture_text: str, candidate: dict, session_history: list[dict]) -> bool:
+def _one_append_vote(capture_text: str, candidates: list[dict], candidate_titles: set,
+                      session_history: list[dict]) -> str | None:
     try:
-        result = _call_append_check(capture_text, candidate, session_history)
-        return isinstance(result, dict) and bool(result.get("append", False))
+        result = _call_append_check(capture_text, candidates, session_history)
+        if not isinstance(result, dict):
+            return None
+        target = _as_str(result.get("append_to"), "")
+        return target if target in candidate_titles else None
     except Exception:
-        return False
+        return None
 
 
 def _one_redundant_vote(capture_text: str, target: dict, session_history: list[dict]) -> bool:
@@ -528,24 +532,33 @@ def _is_redundant_update(capture_text: str, target: dict, session_history: list[
 
 def _check_append(capture_text: str, candidates: list[dict],
                    session_history: list[dict] = None, votes: int = 3) -> dict | None:
-    """Returns the single strong candidate to append to, or None. Scoped to
-    exactly one dominant candidate (reusing AUTO_LINK_SCORE, same threshold
-    as auto-linking/the type relation hint) -- with 0 or 2+ strong matches
-    it's ambiguous which note this would even append to, so it doesn't guess
-    and falls through to creating a normal new (linked) note instead.
+    """Returns the candidate to append to, or None. Mirrors
+    _check_duplicate's architecture exactly: every retrieved candidate is
+    offered to ONE judgment call that picks which one (if any) fits, rather
+    than pre-filtering to a single "dominant" candidate by score before the
+    LLM ever gets a say.
 
-    Uses the same OR-ensemble as duplicate-detection on the assumption this
-    judgment has the same "ask a focused yes/no question, the model
-    under-triggers on the less-common branch" shape -- worth re-measuring if
-    real usage shows otherwise, but not reinventing an already-validated
-    pattern without a reason to."""
-    strong = [c for c in candidates if c.get("score", 0) >= config.AUTO_LINK_SCORE]
-    if len(strong) != 1:
+    Reported live against the real vault: the old version required exactly
+    one candidate scoring >= AUTO_LINK_SCORE before it would even ask the
+    append question -- with 0 or 2+ candidates clearing that bar, which is
+    common given how much embedding scores for related-but-differently-
+    worded captures overlap (see DEDUP_RETRIEVE_SCORE's own calibration
+    note), the append judgment never ran at all. The tool looked like it
+    "just kept adding files" no matter what, because most captures never
+    reached a check that could have said otherwise.
+
+    OR-ensemble, same bias as duplicate-detection: a false-positive append
+    still writes the capture's full text verbatim into a real, existing note
+    -- just possibly not the ideal one -- which is recoverable and not data
+    loss, unlike a missed append, which is what silently keeps producing
+    extra files."""
+    if not candidates:
         return None
-    candidate = strong[0]
+    candidate_titles = {c["title"] for c in candidates}
     for _ in range(votes):
-        if _one_append_vote(capture_text, candidate, session_history):
-            return candidate
+        target_title = _one_append_vote(capture_text, candidates, candidate_titles, session_history)
+        if target_title:
+            return next(c for c in candidates if c["title"] == target_title)
     return None
 
 

@@ -60,11 +60,11 @@ KNOWN_NOTES = [
 
 
 def no_append_response():
-    return chat_returning({"append": False})
+    return chat_returning({"append_to": None})
 
 
-def append_response():
-    return chat_returning({"append": True})
+def append_response(title):
+    return chat_returning({"append_to": title})
 
 
 def redundant_response():
@@ -461,8 +461,16 @@ class TestAppendToExisting:
     """Reported directly: three near-duplicate notes about the same project
     ("Idea Agent Project", "...- Smart Feature", "...(2)") accumulated from
     captures that were really just small new facts about the same subject.
-    A small-update capture strongly tied to exactly one existing note should
-    merge into it instead of spawning another file."""
+    A capture about an existing note's subject should merge into it instead
+    of spawning another file.
+
+    Mirrors TestDuplicateDetection's shape on purpose: _check_append now has
+    the exact same architecture as _check_duplicate (every candidate offered
+    to one judgment call, no score pre-filter) after the old single-
+    dominant-candidate gate was found, via real usage, to skip the append
+    judgment entirely whenever 0 or 2+ candidates crossed AUTO_LINK_SCORE --
+    which is common, not rare, given how much embedding scores for related-
+    but-differently-worded text overlap."""
 
     STRONG = [{"title": "Existing Note", "type": "project",
                "path": "02_Projects/Existing Note.md", "score": 0.90, "excerpt": "x"}]
@@ -471,7 +479,7 @@ class TestAppendToExisting:
         mocker.patch.object(agent.ollama, "chat", side_effect=[
             not_instruction_response(),
             no_dup_response(), no_dup_response(), no_dup_response(),
-            append_response(),
+            append_response("Existing Note"),
             no_redundant_response(),
         ])
         result = agent.process_capture("Existing Note now does X too", self.STRONG)
@@ -480,34 +488,60 @@ class TestAppendToExisting:
             "target_title": "Existing Note", "text": "Existing Note now does X too",
         }]
 
-    def test_no_strong_candidate_skips_append_check_entirely(self, mocker):
-        # score 0.1 is below AUTO_LINK_SCORE, so duplicate-check still runs
-        # normally (it isn't score-gated), but append-check must add zero
-        # extra calls -- exactly meta(1) + 3 duplicate votes + atomize(1).
-        weak = [{"title": "Weak", "type": "concept", "path": "x.md", "score": 0.1, "excerpt": "x"}]
+    def test_no_candidates_skips_append_check_entirely(self, mocker):
         spy = mocker.patch.object(agent.ollama, "chat", side_effect=[
             not_instruction_response(),
-            no_dup_response(), no_dup_response(), no_dup_response(),
             atomize_response([{"title": "X", "type": "concept", "tags": [], "body": "b", "links": []}]),
         ])
-        result = agent.process_capture("idea", weak)
+        result = agent.process_capture("idea with no candidates", [])
         assert result[0]["title"] == "X"
-        assert spy.call_count == 5
+        assert spy.call_count == 2  # meta-check (1) + atomize (1) -- no candidates to offer
 
-    def test_two_strong_candidates_skips_append_check_ambiguously(self, mocker):
-        two_strong = [
+    def test_weak_scoring_candidate_is_still_offered_to_append_check(self, mocker):
+        # Not score-gated any more, same as duplicate-check -- a candidate
+        # under AUTO_LINK_SCORE still gets a real judgment call, it just
+        # isn't auto-linked/type-hinted (that's a separate mechanism).
+        weak = [{"title": "Weak", "type": "concept", "path": "x.md", "score": 0.1, "excerpt": "x"}]
+        mocker.patch.object(agent.ollama, "chat", side_effect=[
+            not_instruction_response(),
+            no_dup_response(), no_dup_response(), no_dup_response(),
+            append_response("Weak"),
+            no_redundant_response(),
+        ])
+        result = agent.process_capture("idea", weak)
+        assert result[0]["action"] == "append"
+        assert result[0]["target_title"] == "Weak"
+
+    def test_llm_picks_the_right_one_of_several_candidates(self, mocker):
+        several = [
             {"title": "A", "type": "project", "path": "a.md", "score": 0.9, "excerpt": "x"},
             {"title": "B", "type": "concept", "path": "b.md", "score": 0.9, "excerpt": "x"},
         ]
         mocker.patch.object(agent.ollama, "chat", side_effect=[
             not_instruction_response(),
             no_dup_response(), no_dup_response(), no_dup_response(),
-            atomize_response([{"title": "X", "type": "concept", "tags": [], "body": "b", "links": []}]),
+            append_response("B"),
+            no_redundant_response(),
         ])
-        result = agent.process_capture("idea", two_strong)
-        assert result[0]["action"] == "create"  # ambiguous which one to append to -- don't guess
+        result = agent.process_capture("idea", several)
+        assert result[0]["action"] == "append"
+        assert result[0]["target_title"] == "B"
 
-    def test_all_append_votes_false_falls_through_to_atomize(self, mocker):
+    def test_hallucinated_append_target_is_ignored(self, mocker):
+        # Model names a note that was never actually offered -- must not be
+        # trusted, and must not crash; falls through to atomize.
+        mocker.patch.object(agent.ollama, "chat", side_effect=[
+            not_instruction_response(),
+            no_dup_response(), no_dup_response(), no_dup_response(),
+            append_response("Never Offered"),
+            append_response("Also Not Real"),
+            append_response("Still Not Real"),
+            atomize_response([{"title": "New", "type": "concept", "tags": [], "body": "b", "links": []}]),
+        ])
+        result = agent.process_capture("idea", self.STRONG)
+        assert result[0]["action"] == "create"
+
+    def test_all_append_votes_null_falls_through_to_atomize(self, mocker):
         mocker.patch.object(agent.ollama, "chat", side_effect=[
             not_instruction_response(),
             no_dup_response(), no_dup_response(), no_dup_response(),
@@ -521,7 +555,7 @@ class TestAppendToExisting:
         mocker.patch.object(agent.ollama, "chat", side_effect=[
             not_instruction_response(),
             no_dup_response(), no_dup_response(), no_dup_response(),
-            no_append_response(), no_append_response(), append_response(),
+            no_append_response(), no_append_response(), append_response("Existing Note"),
             no_redundant_response(),
         ])
         result = agent.process_capture("idea", self.STRONG)
@@ -536,7 +570,7 @@ class TestAppendToExisting:
         mocker.patch.object(agent.ollama, "chat", side_effect=[
             not_instruction_response(),
             no_dup_response(), no_dup_response(), no_dup_response(),
-            append_response(),
+            append_response("Existing Note"),
             redundant_response(), redundant_response(), redundant_response(),
         ])
         result = agent.process_capture("Existing Note, reworded", self.STRONG)
@@ -549,7 +583,7 @@ class TestAppendToExisting:
         mocker.patch.object(agent.ollama, "chat", side_effect=[
             not_instruction_response(),
             no_dup_response(), no_dup_response(), no_dup_response(),
-            append_response(),
+            append_response("Existing Note"),
             redundant_response(), redundant_response(), no_redundant_response(),
         ])
         result = agent.process_capture("Existing Note now does X too", self.STRONG)
@@ -561,13 +595,13 @@ class TestAppendToExisting:
         mocker.patch.object(agent.ollama, "chat", side_effect=[
             not_instruction_response(),
             no_dup_response(), no_dup_response(), no_dup_response(),
-            append_response(),
+            append_response("Existing Note"),
             Exception("boom"),
         ])
         result = agent.process_capture("Existing Note now does X too", self.STRONG)
         assert result[0]["action"] == "append"
 
-    def test_append_check_exception_fails_open_to_atomize(self, mocker):
+    def test_append_check_exception_treated_as_no_and_falls_through(self, mocker):
         mocker.patch.object(agent.ollama, "chat", side_effect=[
             not_instruction_response(),
             no_dup_response(), no_dup_response(), no_dup_response(),
