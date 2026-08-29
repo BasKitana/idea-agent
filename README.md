@@ -44,8 +44,10 @@ of that measurement, not out of guessing:
 - **The voting bias direction depends on which mistake is worse, and that was measured per
   check, not assumed.** Duplicate-detection uses an OR-ensemble (any positive vote counts):
   measured directly, the model's per-call "yes" rate is well under 50%, and a 2-of-3 majority
-  vote made the miss rate *worse*, not better -- a false positive there is harmless (just logs
-  and links), so biasing toward catching it is free. The instruction-detection and delete
+  vote made the miss rate *worse*, not better, so biasing toward catching it is right. That
+  bias was originally justified by calling its false positives harmless; they turned out not to
+  be (see the duplicate-verdict bullet below), so the ensemble still fires freely but no longer
+  gets the last word on discarding anything. The instruction-detection and delete
   checks use the opposite: unanimous vote, because a false positive there either silently
   discards real content or deletes a real note -- both worse than asking again. Delete
   additionally gets its own independent re-confirmation pass on top of the initial parse.
@@ -53,6 +55,23 @@ of that measurement, not out of guessing:
   exactly `01_Concepts/`, `02_Projects/`, `03_Entities/`, `04_Logs/`. This also closes off an
   entire bug class from an earlier free-folder version of this tool (path traversal via a
   malicious/malformed folder name, and everything defaulting to "Inbox").
+- **"Put this in that note" needed to be sayable, and a duplicate verdict must never silently
+  drop content.** Reported live, one session hit both halves of this. A reference URL captured
+  as "&lt;url&gt; Keep this as reference in my ... project" was judged a duplicate of that very
+  project note and dropped -- it survived only as a truncated line in the daily log. Then every
+  attempt to fix it by hand ("No I mean add the link there", "Add this link to the same project
+  we talked about") was recognized as an instruction and refused, because the command vocabulary
+  had no way to express it: `link` only makes one note reference another, it cannot store a URL
+  or any other text. Two fixes. An `add_to` action now stores given content in a named note,
+  recovering the content from session history when the instruction only refers back to it
+  ("add the link there"); it takes no confirmation vote, since it is purely additive and those
+  votes are reserved for operations that destroy something. And a duplicate verdict is now
+  verified before anything is discarded -- the same unanimous redundancy check the append path
+  uses, so a single vote saying "this adds new information" is enough to keep it. Duplicate
+  detection's OR-ensemble was only ever safe on the assumption that a false positive costs
+  nothing; it can cost real content, so it no longer gets the last word. Measured across the
+  exact failing phrasings: 0 refusals in 9 runs, and "No I mean add the link there" now resolves
+  correctly 3/3.
 - **"All" is a precise scope, not a vague one -- and it gets a human confirmation, not an LLM
   vote.** Reported live: "delete all that is here" and "delete all existing notes" were both
   correctly recognized as instructions and then refused anyway, because the command layer could
@@ -191,6 +210,10 @@ to it) to launch the agent without touching a terminal.
 - Type an idea, thought, or fact to capture, atomize, and file it.
 - Name an existing note exactly to delete or link it ("delete X", "link X to Y") -- executed
   if unambiguous, refused with an explanation otherwise.
+- Store something in a specific note ("add this link to my X project", "save this reference in
+  X", "put that in X") -- appended under that note's "## Updates" heading. If you refer back to
+  something instead of restating it ("add the link there"), it recovers the content from earlier
+  in the session.
 - Delete in bulk ("delete all notes", "delete everything", "delete all my logs") -- prints the
   exact file list and waits for you to type "yes" before touching anything.
 - `/list` -- show recently filed notes.
@@ -204,7 +227,7 @@ pip install -r requirements-dev.txt
 pytest
 ```
 
-250 tests, no live Ollama server or network access required -- the embedding model and
+256 tests, no live Ollama server or network access required -- the embedding model and
 `ollama.chat` are mocked/faked for speed and determinism.
 
 ## Configuration

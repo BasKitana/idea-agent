@@ -53,6 +53,10 @@ def delete_all_command_response(note_type=None):
     return chat_returning({"action": "delete_all", "note_type": note_type})
 
 
+def add_to_command_response(target, text):
+    return chat_returning({"action": "add_to", "target": target, "text": text})
+
+
 def confirm_response(confirmed):
     return chat_returning({"confirmed": confirmed})
 
@@ -201,20 +205,53 @@ class TestDuplicateDetection:
         assert spy.call_count == 2
 
     def test_first_vote_duplicate_short_circuits_atomize(self, mocker):
-        spy = mocker.patch.object(agent.ollama, "chat", return_value=dup_response("Existing Note"))
+        spy = mocker.patch.object(agent.ollama, "chat", side_effect=[
+            not_instruction_response(),
+            dup_response("Existing Note"),
+            redundant_response(), redundant_response(), redundant_response(),
+        ])
         result = agent.process_capture("idea", CANDIDATES)
         assert result == [{"action": "duplicate", "duplicate_of": "Existing Note", "note": ""}]
-        assert spy.call_count == 2  # meta-check (1) + first duplicate vote (1); atomize never called
+        assert spy.call_count == 5  # meta(1) + first dup vote(1) + redundancy(3); atomize never called
 
     def test_or_ensemble_catches_a_late_positive_vote(self, mocker):
         # First two votes say "no", third says "yes" -- OR-ensemble must still catch it.
         mocker.patch.object(agent.ollama, "chat", side_effect=[
             not_instruction_response(),
             no_dup_response(), no_dup_response(), dup_response("Existing Note"),
+            redundant_response(), redundant_response(), redundant_response(),
         ])
         result = agent.process_capture("idea", CANDIDATES)
         assert result[0]["action"] == "duplicate"
         assert result[0]["duplicate_of"] == "Existing Note"
+
+    def test_duplicate_that_adds_new_information_is_appended_not_dropped(self, mocker):
+        """Reported live: a reference URL the user explicitly asked to save
+        into his project note ("<url> Keep this as reference in my ...
+        project") was flagged a duplicate of that note and discarded --
+        surviving only as a truncated line in the daily log. Duplicate
+        detection's OR-ensemble over-fires on same-subject content, so a
+        positive verdict is now verified before anything is dropped."""
+        mocker.patch.object(agent.ollama, "chat", side_effect=[
+            not_instruction_response(),
+            dup_response("Existing Note"),
+            no_redundant_response(),  # one dissent is enough: it adds something new
+        ])
+        result = agent.process_capture("https://example.com/api reference for it", CANDIDATES)
+        assert result == [{
+            "action": "append", "target_path": "02_Projects/Existing Note.md",
+            "target_title": "Existing Note",
+            "text": "https://example.com/api reference for it",
+        }]
+
+    def test_duplicate_of_an_uncarried_candidate_still_drops_safely(self, mocker):
+        # Defensive: if the flagged title somehow isn't in candidates, there's
+        # no note to append to -- fall back to the old drop-and-log behavior
+        # rather than crashing.
+        mocker.patch.object(agent, "_check_duplicate", return_value="Ghost Note")
+        mocker.patch.object(agent.ollama, "chat", side_effect=[not_instruction_response()])
+        result = agent.process_capture("idea", CANDIDATES)
+        assert result == [{"action": "duplicate", "duplicate_of": "Ghost Note", "note": ""}]
 
     def test_all_votes_no_falls_through_to_atomize(self, mocker):
         mocker.patch.object(agent.ollama, "chat", side_effect=[
@@ -344,6 +381,50 @@ class TestVaultCommands:
     re-confirmation on top of the initial parse -- the one operation here
     with no recovery path but the OS recycle bin, so it's deliberately
     biased toward refusing over guessing."""
+
+    def test_add_to_stores_content_in_the_named_note(self, mocker):
+        """Reported live: "add this link to the same project we talked about"
+        was correctly detected as an instruction and then refused, because
+        the command vocabulary had no way to express "put this content in
+        that note" -- "link" only makes one note reference another, it can't
+        store a URL. Every phrasing of a perfectly ordinary request failed."""
+        mocker.patch.object(agent.ollama, "chat", side_effect=[
+            instruction_response(), instruction_response(), instruction_response(),
+            add_to_command_response("Old Note", "https://api.github.com/repos/x/y/stats"),
+        ])
+        result = agent.process_capture(
+            "https://api.github.com/repos/x/y/stats add this link to Old Note", [], KNOWN_NOTES)
+        assert result == [{
+            "action": "append", "target_path": "01_Concepts/Old Note.md",
+            "target_title": "Old Note", "text": "https://api.github.com/repos/x/y/stats",
+        }]
+
+    def test_add_to_needs_no_confirmation_vote(self, mocker):
+        # Purely additive, so it isn't gated like delete: exactly 3 meta votes
+        # + 1 parse call, no confirmation round.
+        spy = mocker.patch.object(agent.ollama, "chat", side_effect=[
+            instruction_response(), instruction_response(), instruction_response(),
+            add_to_command_response("Old Note", "a fact"),
+        ])
+        agent.process_capture("add a fact to Old Note", [], KNOWN_NOTES)
+        assert spy.call_count == 4
+
+    def test_add_to_unknown_note_is_refused(self, mocker):
+        mocker.patch.object(agent.ollama, "chat", side_effect=[
+            instruction_response(), instruction_response(), instruction_response(),
+            add_to_command_response("No Such Note", "a fact"),
+        ])
+        result = agent.process_capture("add a fact to No Such Note", [], KNOWN_NOTES)
+        assert result == [{"action": "not_content"}]
+
+    def test_add_to_with_empty_text_is_refused(self, mocker):
+        # Nothing to store -- refuse rather than append a blank line.
+        mocker.patch.object(agent.ollama, "chat", side_effect=[
+            instruction_response(), instruction_response(), instruction_response(),
+            add_to_command_response("Old Note", ""),
+        ])
+        result = agent.process_capture("add that to Old Note", [], KNOWN_NOTES)
+        assert result == [{"action": "not_content"}]
 
     def test_delete_all_returns_every_note_as_a_target(self, mocker):
         # Reported live: "delete all that is here" and "delete all exsisting

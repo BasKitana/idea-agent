@@ -77,21 +77,41 @@ instruction, NOT an unclear one: "all" is precise about scope even though it nam
 Set "note_type" to "concept", "project", "entity", or "log" when the instruction limits itself
 to one of those kinds ("delete all my logs" -> "log"); set it to null when it means everything.
 
+Produce "add_to" when the instruction asks to PUT SOME CONTENT INTO an existing note -- a URL,
+a link, a fact, a detail, a reminder: "add this link to my X project", "put this under X", "save
+this reference in X", "add that to X", "keep this in X". This is the action for content the user
+wants stored inside a specific note, and it is very common -- do NOT answer "unclear" just
+because the instruction also contains the content itself.
+- "target" is the exact existing note title to add to, copied verbatim from the list.
+- "text" is the actual CONTENT to store -- the URL, fact, or detail itself, with the
+  instruction wording stripped out. For "https://example.com/x Add this link to my Y project",
+  text is "https://example.com/x", NOT the whole sentence. Never put the instruction phrasing
+  ("add this to", "keep this in") into "text".
+- If the instruction refers to content from earlier in the conversation rather than restating it
+  ("add the link there", "put that in X"), take the actual content from the recent conversation
+  you are given and use it as "text". If you cannot recover the actual content, answer "unclear".
+
+Do NOT use "link" for this. "link" is only for making one existing note reference ANOTHER
+existing note; it cannot store a URL or any other text. If the instruction gives you content to
+save rather than naming two existing notes, it is "add_to".
+
 Still respond "unclear" for scope words that are genuinely fuzzy about WHICH notes rather than
 meaning all of them -- "delete the old notes", "delete the useless ones", "clean up", "organize
 my vault", "delete the duplicates". Those describe a judgment call you cannot verify; "all" does
 not.
 
 You may be given recent conversation from this session. If the instruction uses "it"/"that"/
-"the one I just mentioned" and the recent conversation clearly identifies exactly one specific
-existing note being discussed, that counts as unambiguously naming it -- resolve the pronoun to
-that note's exact title. If the recent conversation doesn't clearly resolve it to one specific
-note, treat it as unclear rather than guessing.
+"the one I just mentioned"/"the same project we talked about" and the recent conversation
+clearly identifies exactly one specific existing note being discussed, that counts as
+unambiguously naming it -- resolve the reference to that note's exact title. If the recent
+conversation doesn't clearly resolve it to one specific note, treat it as unclear rather than
+guessing.
 
 Respond with ONLY a JSON object, one of:
 {"action": "delete", "target": str}
 {"action": "delete_all", "note_type": str or null}
 {"action": "link", "source": str, "target": str}
+{"action": "add_to", "target": str, "text": str}
 {"action": "unclear"}
 """
 
@@ -710,6 +730,20 @@ def _parse_command(capture_text: str, known_notes: list[dict],
                 return None
             return {"action": "delete_all", "note_type": note_type, "targets": targets}
 
+        if action == "add_to":
+            target = _find_by_title(_as_str(result.get("target"), ""), known_notes)
+            text = _as_str(result.get("text"), "")
+            if not target or not text:
+                return None
+            # Purely additive (same "## Updates" insertion as an automatic
+            # append), so no confirmation vote: the worst case is one extra
+            # line in a note, which the user can see and undo. Confirmation
+            # votes are reserved for operations that destroy content.
+            return {
+                "action": "append", "target_path": target["path"],
+                "target_title": target["title"], "text": text,
+            }
+
         if action == "link":
             source = _find_by_title(_as_str(result.get("source"), ""), known_notes)
             target = _find_by_title(_as_str(result.get("target"), ""), known_notes)
@@ -764,6 +798,24 @@ def process_capture(capture_text: str, candidates: list[dict], known_notes: list
         return [command] if command else [{"action": "not_content"}]
     duplicate_of = _check_duplicate(capture_text, candidates, session_history)
     if duplicate_of:
+        # Duplicate-detection is an OR-ensemble (any one "yes" wins), which
+        # is right for catching restatements but over-fires on a capture that
+        # merely SHARES A SUBJECT with an existing note. Reported live: a
+        # reference URL the user explicitly wanted saved into his project
+        # note ("<url> Keep this as reference in my ... project") was judged
+        # a duplicate of that note and dropped -- it survived only as a
+        # truncated line in the daily log. The README's claim that these
+        # false positives are harmless ("just logs and links") held only
+        # while nothing could be lost by one; it can, so verify before
+        # dropping. Unanimous-redundant to discard, so a single vote saying
+        # "this adds something new" is enough to keep it -- the whole point
+        # of this tool is not losing ideas.
+        dup_note = next((c for c in candidates if c["title"] == duplicate_of), None)
+        if dup_note and not _is_redundant_update(capture_text, dup_note, session_history):
+            return [{
+                "action": "append", "target_path": dup_note["path"],
+                "target_title": dup_note["title"], "text": capture_text.strip(),
+            }]
         return [{"action": "duplicate", "duplicate_of": duplicate_of, "note": ""}]
     append_target = _check_append(capture_text, candidates, session_history)
     if append_target:
