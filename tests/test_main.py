@@ -72,6 +72,67 @@ class TestProcessCapture:
         main.process_capture("some idea", index)
         assert (vault_path / "01_Concepts" / "New Note.md").exists()
 
+    def test_append_item_updates_existing_note_and_reindexes(self, mocker, vault_path):
+        target = vault_path / "02_Projects"
+        target.mkdir(parents=True)
+        note = target / "Existing Note.md"
+        note.write_text("# Existing Note\n\nOriginal.\n", encoding="utf-8")
+
+        index = RagIndex()
+        mocker.patch.object(agent, "process_capture", return_value=[{
+            "action": "append", "target_path": "02_Projects/Existing Note.md",
+            "target_title": "Existing Note", "text": "a new fact",
+        }])
+        main.process_capture("a new fact", index)
+
+        text = note.read_text(encoding="utf-8")
+        assert "Original." in text and "a new fact" in text
+        assert "02_Projects/Existing Note.md" in index.data
+
+    def test_append_to_missing_target_reported_as_failure_not_crash(self, mocker, vault_path):
+        index = RagIndex()
+        mocker.patch.object(agent, "process_capture", return_value=[{
+            "action": "append", "target_path": "02_Projects/Gone.md",
+            "target_title": "Gone", "text": "a fact",
+        }])
+        with main.console.capture() as capture:
+            main.process_capture("a fact", index)  # must not raise
+        assert "Gone" in capture.get()
+
+    def test_delete_item_sends_to_recycle_bin_and_removes_from_index(self, mocker, vault_path):
+        target = vault_path / "01_Concepts"
+        target.mkdir(parents=True)
+        note = target / "Old Note.md"
+        note.write_text("# Old Note\n", encoding="utf-8")
+
+        index = RagIndex()
+        index.data["01_Concepts/Old Note.md"] = {"mtime": 1, "title": "Old Note", "type": "concept", "embedding": [0]}
+        mocker.patch.object(agent, "process_capture", return_value=[{
+            "action": "delete", "target_path": "01_Concepts/Old Note.md", "target_title": "Old Note",
+        }])
+        mocker.patch("vault.send2trash.send2trash")  # don't actually touch the real recycle bin in tests
+        main.process_capture("delete Old Note", index)
+
+        assert "01_Concepts/Old Note.md" not in index.data
+
+    def test_link_item_adds_wikilink_and_reindexes_source(self, mocker, vault_path):
+        target = vault_path / "01_Concepts"
+        target.mkdir(parents=True)
+        source_note = target / "Source.md"
+        source_note.write_text("# Source\n\n## Related\n- none yet\n", encoding="utf-8")
+        (target / "Target.md").write_text("# Target\n", encoding="utf-8")
+
+        index = RagIndex()
+        mocker.patch.object(agent, "process_capture", return_value=[{
+            "action": "link", "source_path": "01_Concepts/Source.md", "source_title": "Source",
+            "target_path": "01_Concepts/Target.md", "target_title": "Target",
+        }])
+        main.process_capture("link Source to Target", index)
+
+        text = source_note.read_text(encoding="utf-8")
+        assert "[[Target]]" in text
+        assert "01_Concepts/Source.md" in index.data
+
     def test_not_content_item_writes_nothing_and_explains(self, mocker, vault_path):
         index = RagIndex()
         mocker.patch.object(agent, "process_capture", return_value=[{"action": "not_content"}])

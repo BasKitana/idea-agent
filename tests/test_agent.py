@@ -37,6 +37,45 @@ def instruction_response():
     return chat_returning({"is_instruction": True})
 
 
+def delete_command_response(target):
+    return chat_returning({"action": "delete", "target": target})
+
+
+def link_command_response(source, target):
+    return chat_returning({"action": "link", "source": source, "target": target})
+
+
+def unclear_command_response():
+    return chat_returning({"action": "unclear"})
+
+
+def confirm_response(confirmed):
+    return chat_returning({"confirmed": confirmed})
+
+
+KNOWN_NOTES = [
+    {"title": "Old Note", "path": "01_Concepts/Old Note.md"},
+    {"title": "Other Note", "path": "01_Concepts/Other Note.md"},
+]
+
+
+def no_append_response():
+    return chat_returning({"append": False})
+
+
+def append_response():
+    return chat_returning({"append": True})
+
+
+# process_capture() also runs an append-check (up to 3 OR-ensemble votes,
+# same shape as duplicate-check) whenever candidates contain exactly one
+# entry at/above AUTO_LINK_SCORE -- i.e. every test using CANDIDATES (score
+# 0.6) or a locally-defined single strong candidate. Any side_effect list
+# for those must account for it (3 more items between the duplicate votes
+# and the atomize response) or the sequence silently degrades to the
+# fallback-on-exhaustion path instead of testing what it says it tests.
+
+
 # process_capture() now always runs the meta-command check first. `return_value`
 # mocks (a single response reused for every call) are naturally safe -- none of
 # dup_response/no_dup_response/atomize_response include an "is_instruction" key,
@@ -47,10 +86,16 @@ def instruction_response():
 
 class TestMetaCommandDetection:
     def test_instruction_short_circuits_before_any_other_call(self, mocker):
+        # return_value repeats {"is_instruction": True} for every call,
+        # including the command-parse call -- which then has no "action" key,
+        # so it correctly falls through to "unclear" -> not_content.
         spy = mocker.patch.object(agent.ollama, "chat", return_value=instruction_response())
         result = agent.process_capture("Make me a file that links to another file.", CANDIDATES)
         assert result == [{"action": "not_content"}]
-        assert spy.call_count == 1  # neither duplicate-check nor atomize ever ran
+        # Unanimous vote: confirming all 3 agree costs 3 calls (can't short-circuit
+        # on agreement, only on the first disagreement), plus 1 command-parse call --
+        # but still short-circuits before ever reaching duplicate-check or atomize.
+        assert spy.call_count == 4
 
     def test_non_instruction_proceeds_to_normal_pipeline(self, mocker):
         mocker.patch.object(agent.ollama, "chat", side_effect=[
@@ -115,6 +160,7 @@ class TestDuplicateDetection:
         mocker.patch.object(agent.ollama, "chat", side_effect=[
             not_instruction_response(),
             no_dup_response(), no_dup_response(), no_dup_response(),
+            no_append_response(), no_append_response(), no_append_response(),
             atomize_response([{"title": "New", "type": "concept", "tags": [], "body": "b", "links": []}]),
         ])
         result = agent.process_capture("idea", CANDIDATES)
@@ -129,6 +175,7 @@ class TestDuplicateDetection:
             dup_response("Some Note That Was Never A Candidate"),
             dup_response("Also Not Real"),
             dup_response("Still Not Real"),
+            no_append_response(), no_append_response(), no_append_response(),
             atomize_response([{"title": "New", "type": "concept", "tags": [], "body": "b", "links": []}]),
         ])
         result = agent.process_capture("idea", CANDIDATES)
@@ -138,6 +185,7 @@ class TestDuplicateDetection:
         mocker.patch.object(agent.ollama, "chat", side_effect=[
             not_instruction_response(),
             Exception("boom"), Exception("boom"), Exception("boom"),
+            no_append_response(), no_append_response(), no_append_response(),
             atomize_response([{"title": "New", "type": "concept", "tags": [], "body": "b", "links": []}]),
         ])
         result = agent.process_capture("idea", CANDIDATES)
@@ -184,6 +232,7 @@ class TestAutoLink:
         mocker.patch.object(agent.ollama, "chat", side_effect=[
             not_instruction_response(),
             no_dup_response(), no_dup_response(), no_dup_response(),
+            no_append_response(), no_append_response(), no_append_response(),
             atomize_response([{"title": "New", "type": "concept", "tags": [], "body": "b", "links": []}]),
         ])
         result = agent.process_capture("idea", candidates)
@@ -204,6 +253,7 @@ class TestAutoLink:
         mocker.patch.object(agent.ollama, "chat", side_effect=[
             not_instruction_response(),
             no_dup_response(), no_dup_response(), no_dup_response(),
+            no_append_response(), no_append_response(), no_append_response(),
             atomize_response([{"title": "New", "type": "concept", "tags": [], "body": "b",
                                 "links": ["Existing Note"]}]),
         ])
@@ -218,6 +268,7 @@ class TestAutoLink:
         mocker.patch.object(agent.ollama, "chat", side_effect=[
             not_instruction_response(),
             no_dup_response(), no_dup_response(), no_dup_response(),
+            no_append_response(), no_append_response(), no_append_response(),
             atomize_response([
                 {"title": "Note A", "type": "project", "tags": [], "body": "b1", "links": []},
                 {"title": "Note B", "type": "concept", "tags": [], "body": "b2", "links": []},
@@ -225,6 +276,189 @@ class TestAutoLink:
         ])
         result = agent.process_capture("compound idea", candidates)
         assert all("Existing Note" not in item["links"] for item in result)
+
+
+class TestVaultCommands:
+    """Delete/link execution for unambiguous, named-target vault
+    instructions. Delete carries its own independent unanimous
+    re-confirmation on top of the initial parse -- the one operation here
+    with no recovery path but the OS recycle bin, so it's deliberately
+    biased toward refusing over guessing."""
+
+    def test_delete_matches_title_despite_hyphen_case_difference(self, mocker):
+        # Reported live: a note auto-titled "HNSW-indexing" by atomize
+        # couldn't be found by an instruction naming it "HNSW indexing" --
+        # same words, different incidental punctuation/case.
+        mocker.patch.object(agent.ollama, "chat", side_effect=[
+            instruction_response(), instruction_response(), instruction_response(),
+            delete_command_response("HNSW indexing"),
+            confirm_response(True), confirm_response(True), confirm_response(True),
+        ])
+        notes = [{"title": "HNSW-indexing", "path": "01_Concepts/HNSW-indexing.md"}]
+        result = agent.process_capture("delete HNSW indexing", [], notes)
+        assert result == [{
+            "action": "delete", "target_path": "01_Concepts/HNSW-indexing.md",
+            "target_title": "HNSW-indexing",
+        }]
+
+    def test_delete_confirmed_executes(self, mocker):
+        mocker.patch.object(agent.ollama, "chat", side_effect=[
+            instruction_response(), instruction_response(), instruction_response(),
+            delete_command_response("Old Note"),
+            confirm_response(True), confirm_response(True), confirm_response(True),
+        ])
+        result = agent.process_capture("delete Old Note", [], KNOWN_NOTES)
+        assert result == [{
+            "action": "delete", "target_path": "01_Concepts/Old Note.md", "target_title": "Old Note",
+        }]
+
+    def test_delete_target_not_a_real_note_is_refused(self, mocker):
+        mocker.patch.object(agent.ollama, "chat", side_effect=[
+            instruction_response(), instruction_response(), instruction_response(),
+            delete_command_response("Nonexistent Note"),
+        ])
+        result = agent.process_capture("delete Nonexistent Note", [], KNOWN_NOTES)
+        assert result == [{"action": "not_content"}]
+
+    def test_delete_confirmation_disagreement_is_refused(self, mocker):
+        mocker.patch.object(agent.ollama, "chat", side_effect=[
+            instruction_response(), instruction_response(), instruction_response(),
+            delete_command_response("Old Note"),
+            confirm_response(True), confirm_response(False),
+        ])
+        result = agent.process_capture("delete Old Note", [], KNOWN_NOTES)
+        assert result == [{"action": "not_content"}]
+
+    def test_link_both_found_executes(self, mocker):
+        mocker.patch.object(agent.ollama, "chat", side_effect=[
+            instruction_response(), instruction_response(), instruction_response(),
+            link_command_response("Old Note", "Other Note"),
+        ])
+        result = agent.process_capture("link Old Note to Other Note", [], KNOWN_NOTES)
+        assert result == [{
+            "action": "link", "source_path": "01_Concepts/Old Note.md", "source_title": "Old Note",
+            "target_path": "01_Concepts/Other Note.md", "target_title": "Other Note",
+        }]
+
+    def test_link_to_itself_is_refused(self, mocker):
+        mocker.patch.object(agent.ollama, "chat", side_effect=[
+            instruction_response(), instruction_response(), instruction_response(),
+            link_command_response("Old Note", "Old Note"),
+        ])
+        result = agent.process_capture("link Old Note to itself", [], KNOWN_NOTES)
+        assert result == [{"action": "not_content"}]
+
+    def test_link_with_hallucinated_target_is_refused(self, mocker):
+        mocker.patch.object(agent.ollama, "chat", side_effect=[
+            instruction_response(), instruction_response(), instruction_response(),
+            link_command_response("Old Note", "Ghost Note"),
+        ])
+        result = agent.process_capture("link Old Note to Ghost Note", [], KNOWN_NOTES)
+        assert result == [{"action": "not_content"}]
+
+    def test_unclear_action_is_refused(self, mocker):
+        mocker.patch.object(agent.ollama, "chat", side_effect=[
+            instruction_response(), instruction_response(), instruction_response(),
+            unclear_command_response(),
+        ])
+        result = agent.process_capture("clean up my vault", [], KNOWN_NOTES)
+        assert result == [{"action": "not_content"}]
+
+    def test_command_parse_exception_is_refused_not_crashed(self, mocker):
+        mocker.patch.object(agent.ollama, "chat", side_effect=[
+            instruction_response(), instruction_response(), instruction_response(),
+            Exception("boom"),
+        ])
+        result = agent.process_capture("delete Old Note", [], KNOWN_NOTES)
+        assert result == [{"action": "not_content"}]
+
+    def test_no_known_notes_defaults_to_empty_list(self, mocker):
+        # process_capture() with known_notes omitted must not crash.
+        mocker.patch.object(agent.ollama, "chat", side_effect=[
+            instruction_response(), instruction_response(), instruction_response(),
+            unclear_command_response(),
+        ])
+        result = agent.process_capture("delete something", [])
+        assert result == [{"action": "not_content"}]
+
+
+class TestAppendToExisting:
+    """Reported directly: three near-duplicate notes about the same project
+    ("Idea Agent Project", "...- Smart Feature", "...(2)") accumulated from
+    captures that were really just small new facts about the same subject.
+    A small-update capture strongly tied to exactly one existing note should
+    merge into it instead of spawning another file."""
+
+    STRONG = [{"title": "Existing Note", "type": "project",
+               "path": "02_Projects/Existing Note.md", "score": 0.90, "excerpt": "x"}]
+
+    def test_append_vote_returns_append_action_with_correct_target(self, mocker):
+        mocker.patch.object(agent.ollama, "chat", side_effect=[
+            not_instruction_response(),
+            no_dup_response(), no_dup_response(), no_dup_response(),
+            append_response(),
+        ])
+        result = agent.process_capture("Existing Note now does X too", self.STRONG)
+        assert result == [{
+            "action": "append", "target_path": "02_Projects/Existing Note.md",
+            "target_title": "Existing Note", "text": "Existing Note now does X too",
+        }]
+
+    def test_no_strong_candidate_skips_append_check_entirely(self, mocker):
+        # score 0.1 is below AUTO_LINK_SCORE, so duplicate-check still runs
+        # normally (it isn't score-gated), but append-check must add zero
+        # extra calls -- exactly meta(1) + 3 duplicate votes + atomize(1).
+        weak = [{"title": "Weak", "type": "concept", "path": "x.md", "score": 0.1, "excerpt": "x"}]
+        spy = mocker.patch.object(agent.ollama, "chat", side_effect=[
+            not_instruction_response(),
+            no_dup_response(), no_dup_response(), no_dup_response(),
+            atomize_response([{"title": "X", "type": "concept", "tags": [], "body": "b", "links": []}]),
+        ])
+        result = agent.process_capture("idea", weak)
+        assert result[0]["title"] == "X"
+        assert spy.call_count == 5
+
+    def test_two_strong_candidates_skips_append_check_ambiguously(self, mocker):
+        two_strong = [
+            {"title": "A", "type": "project", "path": "a.md", "score": 0.9, "excerpt": "x"},
+            {"title": "B", "type": "concept", "path": "b.md", "score": 0.9, "excerpt": "x"},
+        ]
+        mocker.patch.object(agent.ollama, "chat", side_effect=[
+            not_instruction_response(),
+            no_dup_response(), no_dup_response(), no_dup_response(),
+            atomize_response([{"title": "X", "type": "concept", "tags": [], "body": "b", "links": []}]),
+        ])
+        result = agent.process_capture("idea", two_strong)
+        assert result[0]["action"] == "create"  # ambiguous which one to append to -- don't guess
+
+    def test_all_append_votes_false_falls_through_to_atomize(self, mocker):
+        mocker.patch.object(agent.ollama, "chat", side_effect=[
+            not_instruction_response(),
+            no_dup_response(), no_dup_response(), no_dup_response(),
+            no_append_response(), no_append_response(), no_append_response(),
+            atomize_response([{"title": "New", "type": "concept", "tags": [], "body": "b", "links": []}]),
+        ])
+        result = agent.process_capture("idea", self.STRONG)
+        assert result[0]["action"] == "create"
+
+    def test_or_ensemble_catches_a_late_positive_append_vote(self, mocker):
+        mocker.patch.object(agent.ollama, "chat", side_effect=[
+            not_instruction_response(),
+            no_dup_response(), no_dup_response(), no_dup_response(),
+            no_append_response(), no_append_response(), append_response(),
+        ])
+        result = agent.process_capture("idea", self.STRONG)
+        assert result[0]["action"] == "append"
+
+    def test_append_check_exception_fails_open_to_atomize(self, mocker):
+        mocker.patch.object(agent.ollama, "chat", side_effect=[
+            not_instruction_response(),
+            no_dup_response(), no_dup_response(), no_dup_response(),
+            Exception("boom"), Exception("boom"), Exception("boom"),
+            atomize_response([{"title": "New", "type": "concept", "tags": [], "body": "b", "links": []}]),
+        ])
+        result = agent.process_capture("idea", self.STRONG)
+        assert result[0]["action"] == "create"
 
 
 class TestAtomize:
@@ -249,6 +483,7 @@ class TestAtomize:
         mocker.patch.object(agent.ollama, "chat", side_effect=[
             not_instruction_response(),
             no_dup_response(), no_dup_response(), no_dup_response(),
+            no_append_response(), no_append_response(), no_append_response(),
             atomize_response([{"title": "New", "type": "concept", "tags": [],
                                 "body": "b", "links": ["Existing Note"]}]),
         ])

@@ -4,3 +4,4 @@ numpy
 pyyaml
 rich
 python-dotenv
+send2trash

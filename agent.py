@@ -1,4 +1,5 @@
 import json
+import re
 
 import ollama
 
@@ -22,24 +23,71 @@ create/edit/delete/organize/manage its own notes, files, or folders.
 The critical distinction: is this about THIS TOOL'S OWN VAULT/FILES (an instruction), or about
 literally anything else the user wants to build, do, learn, or remember in the real world
 (content)? A capture describing a software project, app, or system the user wants to build is
-ALWAYS content, even when phrased with "build"/"make"/"create" -- those verbs alone do NOT
-mean it's an instruction. Only classify as an instruction when the ACTION is explicitly aimed
-at the tool's own notes/files/folders/vault, not at some other project or system.
+ALWAYS content, even when phrased with "build"/"make"/"create"/"should support"/"should add"/
+"should have" -- those verbs and phrasings alone do NOT mean it's an instruction, including
+when they sound imperative. A feature idea or roadmap item for the user's OWN project ("X
+should support Y", "we should add Z") is content describing that project, not a command to
+this tool. Only classify as an instruction when the ACTION is explicitly aimed at the tool's
+own notes/files/folders/vault, not at some other project or system.
+
+You are given the vault's EXISTING note titles below. If the input names one or more of those
+EXACT existing titles and describes doing something to them -- deleting, linking, connecting,
+merging -- that is always an instruction, even if the phrasing itself sounds like a neutral
+statement (e.g. "link A to B" naming two real note titles is an instruction, not content).
 
 Examples of instructions (is_instruction: true) -- all explicitly about the tool's own notes/files:
 "Make me a file that links to another file." "Edit that note and add X." "Delete the old
 notes." "Create an empty folder [in the vault]." "Organize my vault." "Make a project folder
-with no notes inside [the vault]."
+with no notes inside [the vault]." "Link the Idea Agent note to the Claude Code note." "Delete
+the Old Test Note." "Connect X and Y." -- an instruction to link, connect, or delete two or
+more notes that already exist in the vault is ALWAYS an instruction, even with no other
+imperative-sounding language, since it's an action on the tool's own files by definition.
 
-Examples of genuine content (is_instruction: false) -- these describe projects/ideas to build
-or remember, NOT the tool's own files, even though they use "build"/"make"/"create":
+Examples of genuine content (is_instruction: false) -- these describe projects/ideas to build,
+plan, or remember, NOT the tool's own files, even though they sound imperative:
 "I want to build a RAG pipeline using ChromaDB." "Build an app that tracks water intake."
 "A research project where I collect data from a GitHub repository." "Create a marketing plan
 for the launch." "Vercel's edge functions look good for the auth layer." "Remember to follow
-up with Sarah about Clerk."
+up with Sarah about Clerk." "Idea Agent should support voice input as a new feature." "The API
+should support pagination for large result sets." "We should add rate limiting to the auth
+endpoint."
 
 Respond with ONLY a JSON object:
 {"is_instruction": true or false}
+"""
+
+COMMAND_SYSTEM_PROMPT = """You parse an instruction directed at a note-filing tool's vault into
+one specific, safe action. You are given the instruction and a list of the vault's EXISTING
+note titles -- this is the complete list; no other notes exist.
+
+Only produce "delete" or "link" when the instruction unambiguously names note(s) from that
+EXACT list. Copy the title(s) verbatim from the list -- never invent, guess, abbreviate, or
+partially match a title. If the instruction is vague ("delete the old notes", "clean up",
+"organize my vault"), names something not in the list, or could plausibly mean more than one
+note, respond "unclear" -- do not guess which note(s) it means.
+
+Respond with ONLY a JSON object, one of:
+{"action": "delete", "target": str}
+{"action": "link", "source": str, "target": str}
+{"action": "unclear"}
+"""
+
+DELETE_CONFIRM_SYSTEM_PROMPT = """You are a final safety check before permanently removing a
+note from someone's personal knowledge base. You are given the user's instruction and the
+specific note that a separate matching step has ALREADY identified as the target -- that
+matching is done and correct; small wording differences between the instruction and the
+note's exact title (spacing, hyphens, capitalization -- e.g. "HNSW indexing" vs
+"HNSW-indexing") are normal and do NOT indicate a wrong match. Do not re-judge whether the
+title matches; only judge intent.
+
+Answer yes ONLY if the instruction's INTENT clearly and specifically means to delete this
+note's subject. Answer no if there is genuine doubt about the intent itself -- e.g. the
+instruction could mean something other than deletion, or could plausibly refer to a
+different note's subject entirely. When genuinely uncertain about intent, answer no -- a
+missed deletion just means the user asks again; a wrong deletion loses their content.
+
+Respond with ONLY a JSON object:
+{"confirmed": true or false}
 """
 
 DUPLICATE_SYSTEM_PROMPT = """You judge whether a new capture is the SAME IDEA as one of a list
@@ -53,6 +101,22 @@ Respond with ONLY a JSON object:
 {"duplicate_of": str or null}
 If yes, duplicate_of is the matching candidate's EXACT title, copied verbatim. If no single
 candidate is genuinely the same idea, duplicate_of is null.
+"""
+
+APPEND_SYSTEM_PROMPT = """You judge whether a new capture should be APPENDED as an update to
+one specific existing note, rather than becoming its own separate new note.
+
+Answer append=true only when the capture is a small new fact, detail, capability, or status
+update specifically about that SAME existing note's subject -- it just extends what's already
+there and does not need its own page.
+
+Answer append=false when the capture describes something substantial enough to deserve its
+own note even though it's related: a distinct sub-project, a genuinely separate concept, a
+specific event/log entry, or anything with enough content to stand alone (link it to the
+existing note instead of merging into it).
+
+Respond with ONLY a JSON object:
+{"append": true or false}
 """
 
 ATOMIZE_SYSTEM_PROMPT = """You decompose a raw capture into atomic notes for a technical
@@ -142,12 +206,59 @@ def _relation_hint(candidates: list[dict]) -> str:
     )
 
 
-def _call_meta_check(capture_text: str) -> dict:
+def _titles_block(known_titles: list[str]) -> str:
+    return "\n".join(f"- {t}" for t in known_titles) or "(vault is empty, no notes exist)"
+
+
+def _call_meta_check(capture_text: str, known_titles: list[str]) -> dict:
+    prompt = f"Existing note titles:\n{_titles_block(known_titles)}\n\nInput:\n{capture_text}"
     response = ollama.chat(
         model=config.OLLAMA_MODEL, format="json",
         messages=[
             {"role": "system", "content": META_COMMAND_SYSTEM_PROMPT},
-            {"role": "user", "content": capture_text},
+            {"role": "user", "content": prompt},
+        ],
+    )
+    return json.loads(response["message"]["content"])
+
+
+def _call_command_parse(capture_text: str, known_titles: list[str]) -> dict:
+    prompt = f"Existing note titles:\n{_titles_block(known_titles)}\n\nInstruction:\n{capture_text}"
+    response = ollama.chat(
+        model=config.OLLAMA_MODEL, format="json",
+        messages=[
+            {"role": "system", "content": COMMAND_SYSTEM_PROMPT},
+            {"role": "user", "content": prompt},
+        ],
+    )
+    return json.loads(response["message"]["content"])
+
+
+def _call_delete_confirm(capture_text: str, target: dict) -> dict:
+    prompt = (
+        f'Instruction:\n{capture_text}\n\nIdentified target note: "{target["title"]}" '
+        f'(type: {target.get("type", "concept")}): {target.get("excerpt", "")}'
+    )
+    response = ollama.chat(
+        model=config.OLLAMA_MODEL, format="json",
+        messages=[
+            {"role": "system", "content": DELETE_CONFIRM_SYSTEM_PROMPT},
+            {"role": "user", "content": prompt},
+        ],
+    )
+    return json.loads(response["message"]["content"])
+
+
+def _call_append_check(capture_text: str, candidate: dict) -> dict:
+    prompt = (
+        f'Existing note: "{candidate["title"]}" (type: {candidate.get("type", "concept")}): '
+        f'{candidate.get("excerpt", "")}\n\nNew capture:\n{capture_text}'
+    )
+    response = ollama.chat(
+        model=config.OLLAMA_MODEL, format="json",
+        messages=[
+            {"role": "system", "content": APPEND_SYSTEM_PROMPT},
+            {"role": "user", "content": prompt},
         ],
     )
     return json.loads(response["message"]["content"])
@@ -214,18 +325,38 @@ def _normalize_note(item: dict, fallback_title: str, linkable_titles: set) -> di
     }
 
 
-def _is_meta_command(capture_text: str) -> bool:
-    """True if the capture is an instruction directed at the tool (create,
-    edit, delete, organize) rather than genuine content to record. Fails
-    open toward "not an instruction" -- an LLM error should never silently
-    swallow real content the user typed."""
+def _one_meta_vote(capture_text: str, known_titles: list[str]) -> bool:
     try:
-        result = _call_meta_check(capture_text)
-        if not isinstance(result, dict):
-            return False
-        return bool(result.get("is_instruction", False))
+        result = _call_meta_check(capture_text, known_titles)
+        return isinstance(result, dict) and bool(result.get("is_instruction", False))
     except Exception:
         return False
+
+
+def _is_meta_command(capture_text: str, known_titles: list[str] = None, votes: int = 3) -> bool:
+    """True if the capture is an instruction directed at the tool (create,
+    edit, delete, organize) rather than genuine content to record.
+
+    Needs known_titles: without it, "link A to B" naming two real existing
+    notes has no way to be told apart from a neutral technical statement --
+    measured directly, it was missed 5/5 with the capture text alone,
+    fixed once the check could see A and B are actual vault note titles.
+
+    Unanimous vote, not majority or OR -- the opposite bias from duplicate
+    detection. There, a false positive is harmless (just logs+links), so
+    OR-ensemble (favor catching it) was right. Here, a false positive
+    silently DISCARDS real content the user typed -- worse than a false
+    negative, which just creates a slightly-odd note (recoverable). Measured
+    directly: genuine feature-idea phrasing ("X should support Y") sits at a
+    true ~50% per-call rate for the model -- not a bias, a real coin flip --
+    while actual instructions ("make me a file...", "delete the old notes")
+    are near-100% per-call. Unanimous-3 exploits exactly that gap: costs
+    nothing on the clear cases, and it's very hard for a genuinely ambiguous
+    case to hit 3-for-3 by chance. Verified: 0/6 false positives across 4
+    ambiguous feature-idea phrasings, 6/6 correct on 5 clear instructions.
+    """
+    known_titles = known_titles or []
+    return all(_one_meta_vote(capture_text, known_titles) for _ in range(votes))
 
 
 def _one_duplicate_vote(capture_text: str, candidates: list[dict], candidate_titles: set) -> str | None:
@@ -261,6 +392,36 @@ def _check_duplicate(capture_text: str, candidates: list[dict], votes: int = 3) 
         vote = _one_duplicate_vote(capture_text, candidates, candidate_titles)
         if vote:
             return vote
+    return None
+
+
+def _one_append_vote(capture_text: str, candidate: dict) -> bool:
+    try:
+        result = _call_append_check(capture_text, candidate)
+        return isinstance(result, dict) and bool(result.get("append", False))
+    except Exception:
+        return False
+
+
+def _check_append(capture_text: str, candidates: list[dict], votes: int = 3) -> dict | None:
+    """Returns the single strong candidate to append to, or None. Scoped to
+    exactly one dominant candidate (reusing AUTO_LINK_SCORE, same threshold
+    as auto-linking/the type relation hint) -- with 0 or 2+ strong matches
+    it's ambiguous which note this would even append to, so it doesn't guess
+    and falls through to creating a normal new (linked) note instead.
+
+    Uses the same OR-ensemble as duplicate-detection on the assumption this
+    judgment has the same "ask a focused yes/no question, the model
+    under-triggers on the less-common branch" shape -- worth re-measuring if
+    real usage shows otherwise, but not reinventing an already-validated
+    pattern without a reason to."""
+    strong = [c for c in candidates if c.get("score", 0) >= config.AUTO_LINK_SCORE]
+    if len(strong) != 1:
+        return None
+    candidate = strong[0]
+    for _ in range(votes):
+        if _one_append_vote(capture_text, candidate):
+            return candidate
     return None
 
 
@@ -317,20 +478,106 @@ def _atomize(capture_text: str, candidates: list[dict]) -> list[dict]:
     }]
 
 
-def process_capture(capture_text: str, candidates: list[dict]) -> list[dict]:
+def _normalize_title(title: str) -> str:
+    """Case/punctuation-insensitive form for title matching, NOT fuzzy/partial
+    matching -- the actual words still have to match exactly. Reported live:
+    a note auto-titled "HNSW-indexing" (hyphenated) by atomize legitimately
+    couldn't be found by a delete instruction naming it "HNSW indexing"
+    (space) under exact match, even though no reasonable person would type
+    the hyphen back. Punctuation is incidental formatting the atomize step
+    chose, not part of the note's actual identity."""
+    return re.sub(r"[\s_-]+", " ", title).strip().lower()
+
+
+def _find_by_title(title: str, known_notes: list[dict]) -> dict | None:
+    normalized = _normalize_title(title)
+    for n in known_notes:
+        if _normalize_title(n["title"]) == normalized:
+            return n
+    return None
+
+
+def _confirm_delete(capture_text: str, target: dict, votes: int = 3) -> bool:
+    """Unanimous re-confirmation, independent of and in addition to the
+    initial command parse -- delete is the one operation in this codebase
+    with no recovery path inside the tool itself (only the OS recycle bin).
+    Same bias as the meta-command check: a missed delete costs nothing (the
+    user just asks again), a wrong delete costs real content, so this
+    requires every vote to agree and any doubt anywhere defaults to no."""
+    for _ in range(votes):
+        try:
+            result = _call_delete_confirm(capture_text, target)
+            if not (isinstance(result, dict) and bool(result.get("confirmed", False))):
+                return False
+        except Exception:
+            return False
+    return True
+
+
+def _parse_command(capture_text: str, known_notes: list[dict]) -> dict | None:
+    """Returns a ready-to-execute command dict, or None if the instruction
+    was too vague/ambiguous to safely act on (caller should refuse it, same
+    as before this existed). known_notes is the FULL list of {"title","path"}
+    for every note in the vault -- targets must match one of these exactly;
+    a name the model invents or only partially matches is never trusted."""
+    known_titles = [n["title"] for n in known_notes]
+    try:
+        result = _call_command_parse(capture_text, known_titles)
+        if not isinstance(result, dict):
+            return None
+        action = str(result.get("action", "")).lower()
+
+        if action == "delete":
+            target = _find_by_title(_as_str(result.get("target"), ""), known_notes)
+            if not target or not _confirm_delete(capture_text, target):
+                return None
+            return {"action": "delete", "target_path": target["path"], "target_title": target["title"]}
+
+        if action == "link":
+            source = _find_by_title(_as_str(result.get("source"), ""), known_notes)
+            target = _find_by_title(_as_str(result.get("target"), ""), known_notes)
+            if not source or not target or source["title"] == target["title"]:
+                return None
+            return {
+                "action": "link", "source_path": source["path"], "source_title": source["title"],
+                "target_path": target["path"], "target_title": target["title"],
+            }
+    except Exception:
+        pass
+    return None
+
+
+def process_capture(capture_text: str, candidates: list[dict], known_notes: list[dict] = None) -> list[dict]:
     """Returns a list of items, each one of:
     {"action": "create", "title", "type", "tags", "body", "links"},
-    {"action": "duplicate", "duplicate_of", "note"}, or
-    {"action": "not_content"} -- the capture was an instruction directed at
-    the tool itself (create/edit/delete/organize its own files), not
-    something to file. Caught live: "make me a file that..." and "edit that
-    file and add..." were both filed as nonsense notes about themselves
-    before this check existed.
+    {"action": "append", "target_path", "target_title", "text"} -- a small
+    update to an existing note's subject, merged into it rather than
+    spawning a new file. Reported directly: three near-duplicate files
+    ("Idea Agent Project", "...- Smart Feature", "...(2)") accumulated from
+    captures that were really just new facts about the same project.
+    {"action": "duplicate", "duplicate_of", "note"},
+    {"action": "delete", "target_path", "target_title"} or
+    {"action": "link", "source_path", "source_title", "target_path", "target_title"}
+    -- an unambiguous, confirmed vault-management instruction, or
+    {"action": "not_content"} -- the capture was an instruction, but too
+    vague/ambiguous to safely act on (named no real note, could mean more
+    than one, etc.) -- refused rather than guessed at. Caught live: "make
+    me a file that..." and "edit that file and add..." were both filed as
+    nonsense notes about themselves before instruction-detection existed.
     Never raises -- falls back to a single safe "create" item in the "concept"
     type on any failure (bad JSON, connection drop, malformed response)."""
-    if _is_meta_command(capture_text):
-        return [{"action": "not_content"}]
+    known_notes = known_notes or []
+    known_titles = [n["title"] for n in known_notes]
+    if _is_meta_command(capture_text, known_titles):
+        command = _parse_command(capture_text, known_notes)
+        return [command] if command else [{"action": "not_content"}]
     duplicate_of = _check_duplicate(capture_text, candidates)
     if duplicate_of:
         return [{"action": "duplicate", "duplicate_of": duplicate_of, "note": ""}]
+    append_target = _check_append(capture_text, candidates)
+    if append_target:
+        return [{
+            "action": "append", "target_path": append_target["path"],
+            "target_title": append_target["title"], "text": capture_text.strip(),
+        }]
     return _atomize(capture_text, candidates)

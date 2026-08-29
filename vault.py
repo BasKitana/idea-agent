@@ -3,6 +3,7 @@ import unicodedata
 from datetime import date
 from pathlib import Path
 
+import send2trash
 import yaml
 
 import config
@@ -123,8 +124,77 @@ def write_note(vault_path: Path, note_type: str, title: str, tags: list[str],
     return path
 
 
+def append_update(vault_path: Path, rel_path: str, text: str) -> Path:
+    """Add a new fact to an existing note without touching anything already
+    there: read the full current content, insert one new bullet under an
+    "## Updates" heading (added once, at the end, if it doesn't exist yet),
+    write the full content back. Never rewrites, reorders, or removes any
+    existing line -- the one operation in this codebase that touches an
+    existing note at all, so it's deliberately this narrow.
+
+    Raises FileNotFoundError if the target no longer exists (e.g. deleted
+    between candidate retrieval and this call) -- callers should treat that
+    like any other per-item failure, not attempt to recover it here.
+    """
+    path = vault_path / rel_path
+    if not path.exists():
+        raise FileNotFoundError(f"{rel_path} no longer exists")
+
+    existing = path.read_text(encoding="utf-8")
+    today = date.today().isoformat()
+    bullet = f"- ({today}) {text.strip()}"
+
+    marker = "## Updates\n"
+    idx = existing.find(marker)
+    if idx == -1:
+        new_content = existing.rstrip("\n") + "\n\n" + marker + bullet + "\n"
+    else:
+        insert_at = idx + len(marker)
+        new_content = existing[:insert_at] + bullet + "\n" + existing[insert_at:]
+
+    path.write_text(new_content, encoding="utf-8")
+    return path
+
+
+def add_link(vault_path: Path, rel_path: str, target_title: str, heading: str = "Related") -> Path:
+    """Additively insert a wikilink to target_title into an existing note's
+    section (creating the heading once if it isn't there yet). Idempotent --
+    a no-op if the link is already present. Never rewrites, reorders, or
+    removes anything already there."""
+    path = vault_path / rel_path
+    if not path.exists():
+        raise FileNotFoundError(f"{rel_path} no longer exists")
+
+    existing = path.read_text(encoding="utf-8")
+    link = _wikilink(target_title)
+    if link in existing or f"[[{slugify(target_title)}]]" in existing:
+        return path
+
+    line = f"- {link}"
+    marker = f"## {heading}\n"
+    idx = existing.find(marker)
+    if idx == -1:
+        new_content = existing.rstrip("\n") + "\n\n" + marker + line + "\n"
+    else:
+        insert_at = idx + len(marker)
+        new_content = existing[:insert_at] + line + "\n" + existing[insert_at:]
+
+    path.write_text(new_content, encoding="utf-8")
+    return path
+
+
+def delete_note(vault_path: Path, rel_path: str) -> None:
+    """Send an existing note to the OS recycle bin -- never a permanent,
+    unrecoverable delete. Raises FileNotFoundError if it's already gone."""
+    path = vault_path / rel_path
+    if not path.exists():
+        raise FileNotFoundError(f"{rel_path} no longer exists")
+    send2trash.send2trash(str(path))
+
+
 def append_daily_log_links(vault_path: Path, new_note_titles: list[str],
-                            duplicate_notes: list[tuple[str, str]]) -> Path:
+                            duplicate_notes: list[tuple[str, str]],
+                            updated_notes: list[tuple[str, str]] = None) -> Path:
     """Ensure today's log note exists and links to everything captured today.
 
     This is the one deliberately bidirectional link in the system: the log
@@ -136,6 +206,11 @@ def append_daily_log_links(vault_path: Path, new_note_titles: list[str],
     `duplicate_notes` is a list of (raw_capture, existing_title) pairs: a
     capture recognized as already covered gets logged here with a link to
     the existing note, rather than ever editing that existing note.
+
+    `updated_notes` is a list of (raw_capture, target_title) pairs: a
+    capture merged into an existing note via append_update() gets logged
+    here too, so today's log stays a complete record of what happened even
+    though no new file was created for it.
     """
     folder_path = vault_path / config.FOLDER_BY_TYPE["log"]
     folder_path.mkdir(parents=True, exist_ok=True)
@@ -151,6 +226,10 @@ def append_daily_log_links(vault_path: Path, new_note_titles: list[str],
     additions += "".join(
         f"\n- Already covered: {raw[:80]!r} -> {_wikilink(existing)}"
         for raw, existing in duplicate_notes
+    )
+    additions += "".join(
+        f"\n- Updated {_wikilink(target)}: {raw[:80]!r}"
+        for raw, target in (updated_notes or [])
     )
     if additions:
         text = text.rstrip("\n") + "\n" + additions.strip("\n") + "\n"

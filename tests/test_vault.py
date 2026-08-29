@@ -219,3 +219,102 @@ class TestAppendDailyLogLinks:
     def test_no_new_content_does_not_error(self, tmp_path):
         path = vault.append_daily_log_links(tmp_path, [], [])
         assert path.exists()
+
+    def test_updated_notes_get_logged_with_link(self, tmp_path):
+        path = vault.append_daily_log_links(tmp_path, [], [], [("raw capture text", "Existing Note")])
+        text = path.read_text(encoding="utf-8")
+        assert "[[Existing Note]]" in text
+        assert "raw capture text" in text
+
+
+class TestDeleteNote:
+    def test_sends_to_recycle_bin_not_permanent_delete(self, tmp_path, mocker):
+        note = tmp_path / "Existing.md"
+        note.write_text("# Existing\n", encoding="utf-8")
+        spy = mocker.patch("vault.send2trash.send2trash")
+        vault.delete_note(tmp_path, "Existing.md")
+        spy.assert_called_once_with(str(note))
+
+    def test_missing_target_raises_file_not_found(self, tmp_path):
+        with pytest.raises(FileNotFoundError):
+            vault.delete_note(tmp_path, "Does Not Exist.md")
+
+
+class TestAddLink:
+    def test_adds_link_under_related_heading(self, tmp_path):
+        note = tmp_path / "Source.md"
+        note.write_text("# Source\n\nBody.\n\n## Related\n- none yet\n", encoding="utf-8")
+        vault.add_link(tmp_path, "Source.md", "Target Note")
+        text = note.read_text(encoding="utf-8")
+        assert "[[Target Note]]" in text
+
+    def test_creates_related_heading_if_missing(self, tmp_path):
+        note = tmp_path / "Source.md"
+        note.write_text("# Source\n\nBody.\n", encoding="utf-8")
+        vault.add_link(tmp_path, "Source.md", "Target Note")
+        text = note.read_text(encoding="utf-8")
+        assert "## Related" in text and "[[Target Note]]" in text
+
+    def test_idempotent_does_not_duplicate_existing_link(self, tmp_path):
+        note = tmp_path / "Source.md"
+        note.write_text("# Source\n\n## Related\n- [[Target Note]]\n", encoding="utf-8")
+        vault.add_link(tmp_path, "Source.md", "Target Note")
+        text = note.read_text(encoding="utf-8")
+        assert text.count("[[Target Note]]") == 1
+
+    def test_missing_source_raises_file_not_found(self, tmp_path):
+        with pytest.raises(FileNotFoundError):
+            vault.add_link(tmp_path, "Does Not Exist.md", "Target Note")
+
+    def test_nothing_existing_is_touched(self, tmp_path):
+        note = tmp_path / "Source.md"
+        original = "# Source\n\nOriginal body content.\n"
+        note.write_text(original, encoding="utf-8")
+        vault.add_link(tmp_path, "Source.md", "Target Note")
+        text = note.read_text(encoding="utf-8")
+        assert text.startswith(original.rstrip("\n"))
+
+
+class TestAppendUpdate:
+    """The one operation in this codebase that touches an existing note at
+    all -- deliberately narrow: read full content, insert exactly one new
+    bullet, write full content back. Never rewrites, reorders, or removes
+    anything already there."""
+
+    def test_adds_updates_heading_on_first_use(self, tmp_path):
+        note = tmp_path / "Existing.md"
+        note.write_text("---\ntitle: \"Existing\"\n---\n\n# Existing\n\nOriginal body.\n", encoding="utf-8")
+        vault.append_update(tmp_path, "Existing.md", "a new fact")
+        text = note.read_text(encoding="utf-8")
+        assert "## Updates" in text
+        assert "a new fact" in text
+        assert "Original body." in text  # nothing existing was touched
+
+    def test_second_update_appends_under_same_heading_not_a_new_one(self, tmp_path):
+        note = tmp_path / "Existing.md"
+        note.write_text("# Existing\n\nBody.\n", encoding="utf-8")
+        vault.append_update(tmp_path, "Existing.md", "first fact")
+        vault.append_update(tmp_path, "Existing.md", "second fact")
+        text = note.read_text(encoding="utf-8")
+        assert text.count("## Updates") == 1
+        assert "first fact" in text and "second fact" in text
+
+    def test_missing_target_raises_file_not_found(self, tmp_path):
+        with pytest.raises(FileNotFoundError):
+            vault.append_update(tmp_path, "Does Not Exist.md", "a fact")
+
+    def test_bullet_includes_todays_date(self, tmp_path):
+        import datetime
+        note = tmp_path / "Existing.md"
+        note.write_text("# Existing\n\nBody.\n", encoding="utf-8")
+        vault.append_update(tmp_path, "Existing.md", "a fact")
+        text = note.read_text(encoding="utf-8")
+        assert datetime.date.today().isoformat() in text
+
+    def test_frontmatter_and_heading_survive_untouched(self, tmp_path):
+        note = tmp_path / "Existing.md"
+        original = '---\ntitle: "Existing"\ntype: project\ntags:\n  - a\n---\n\n# Existing\n\nBody.\n'
+        note.write_text(original, encoding="utf-8")
+        vault.append_update(tmp_path, "Existing.md", "a fact")
+        text = note.read_text(encoding="utf-8")
+        assert text.startswith(original.rstrip("\n"))
