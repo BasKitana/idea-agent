@@ -64,8 +64,20 @@ def confirm_bulk_delete(targets: list[dict], note_type: str | None) -> bool:
     return answer == "yes"
 
 
+def ask_user(question: str) -> str:
+    """Put a clarifying question to the user and return their reply (empty if
+    they decline). This tool is an assistant, not a parser: when an
+    instruction is real but ambiguous, asking beats both guessing and
+    refusing."""
+    console.print(f"\n[bold cyan]?[/bold cyan] {escape(question)}")
+    try:
+        return console.input("[dim](answer, or press Enter to skip)[/dim] ").strip()
+    except (EOFError, KeyboardInterrupt):
+        return ""
+
+
 def process_capture(capture_text: str, index: RagIndex, session_history: list[dict] = None,
-                     confirm: callable = None) -> None:
+                     confirm: callable = None, ask: callable = None) -> None:
     """session_history is mutated in place: this turn's outcome is appended
     and the list is capped at SESSION_MEMORY_SIZE, so the caller's list
     object reflects the growing short-term memory without needing to
@@ -77,6 +89,8 @@ def process_capture(capture_text: str, index: RagIndex, session_history: list[di
         session_history = []
     if confirm is None:
         confirm = confirm_bulk_delete
+    if ask is None:
+        ask = ask_user
     candidates = index.query(
         capture_text, top_k=config.DEDUP_TOP_K, min_score=config.DEDUP_RETRIEVE_SCORE,
     )
@@ -114,12 +128,31 @@ def process_capture(capture_text: str, index: RagIndex, session_history: list[di
     with console.status("Thinking..."):
         items = agent.process_capture(capture_text, candidates, known_notes, session_history)
 
+    # An instruction it couldn't pin down asks rather than refusing. Handled
+    # here, before the execution loop, so the answer feeds a clean second
+    # pass instead of recursing mid-execution. Exactly one round.
+    if len(items) == 1 and items[0]["action"] == "ask":
+        answer = ask(items[0]["question"])
+        if not answer:
+            _print_summary([], [], [], not_content=True)
+            session_history.append({
+                "capture": capture_text[:100],
+                "summary": "asked for clarification, got no answer", "subject": None,
+            })
+            del session_history[:-config.SESSION_MEMORY_SIZE]
+            return
+        with console.status("Thinking..."):
+            items = agent.process_capture(
+                capture_text, candidates, known_notes, session_history, clarification=answer,
+            )
+
     today = date.today().isoformat()
     created = []       # (title, path, links)
     duplicates = []    # (capture_text, existing_title)
     updated = []       # (capture_text, target_title)
     deleted = []       # (title,)
     linked = []        # (source_title, target_title)
+    retitled = []      # (old_title, new_title)
     failed = []        # (title_or_desc, error)
     not_content = False
     cancelled = False  # bulk delete offered, human declined at the prompt
@@ -151,13 +184,28 @@ def process_capture(capture_text: str, index: RagIndex, session_history: list[di
                 else:
                     created.append((item["title"], path, item["type"]))
             elif item["action"] == "append":
-                path = vault.append_update(config.VAULT_PATH, item["target_path"], item["text"])
+                if item.get("placement") == "body":
+                    path = vault.append_to_body(config.VAULT_PATH, item["target_path"], item["text"])
+                else:
+                    path = vault.append_update(config.VAULT_PATH, item["target_path"], item["text"])
+                title = item["target_title"]
+                new_title = item.get("new_title")
+                if new_title:
+                    rel = path.relative_to(config.VAULT_PATH).as_posix()
+                    renamed = vault.rename_note(config.VAULT_PATH, rel, new_title)
+                    if renamed != path:
+                        # rename_note refuses (returning the original path) if
+                        # the new filename is already taken -- only record a
+                        # retitle that actually happened.
+                        index.data.pop(rel, None)
+                        path, title = renamed, new_title
+                        retitled.append((item["target_title"], new_title))
                 try:
-                    index.add(path, item["target_title"], path.read_text(encoding="utf-8"))
+                    index.add(path, title, path.read_text(encoding="utf-8"))
                 except Exception:
-                    console.print(f"[yellow]Updated '{item['target_title']}', but the RAG "
+                    console.print(f"[yellow]Updated '{title}', but the RAG "
                                   "index update failed -- it'll resync next launch.[/yellow]")
-                updated.append((capture_text, item["target_title"]))
+                updated.append((capture_text, title))
             elif item["action"] == "delete":
                 vault.delete_note(config.VAULT_PATH, item["target_path"])
                 index.data.pop(item["target_path"], None)
@@ -197,7 +245,8 @@ def process_capture(capture_text: str, index: RagIndex, session_history: list[di
             config.VAULT_PATH, [t for t, _, _ in created], duplicates, updated,
         )
 
-    _print_summary(created, duplicates, failed, not_content, updated, deleted, linked, cancelled)
+    _print_summary(created, duplicates, failed, not_content, updated, deleted, linked, cancelled,
+                    retitled)
     summary = _history_summary(created, duplicates, updated, deleted, linked, failed, not_content)
     subject = _history_subject(created, duplicates, updated, deleted, linked)
     session_history.append({"capture": capture_text[:100], "summary": summary, "subject": subject})
@@ -257,7 +306,7 @@ def _wikilink(title: str) -> str:
 
 
 def _print_summary(created, duplicates, failed, not_content=False, updated=None, deleted=None,
-                    linked=None, cancelled=False):
+                    linked=None, cancelled=False, retitled=None):
     # Titles/paths/errors are LLM-generated or user-supplied text and may
     # contain literal [brackets] -- console.print() treats those as markup
     # tags, so unescaped dynamic text can be silently mangled or dropped
@@ -269,6 +318,8 @@ def _print_summary(created, duplicates, failed, not_content=False, updated=None,
                       f"[dim]({escape(note_type)} -> {escape(str(path))})[/dim]")
     for raw, target in (updated or []):
         lines.append(f"[bold cyan]~ updated[/bold cyan] -> {_wikilink(target)}")
+    for old, new in (retitled or []):
+        lines.append(f"[bold cyan]~ retitled[/bold cyan] {escape(old)} -> {_wikilink(new)}")
     for source, target in (linked or []):
         lines.append(f"[bold cyan]~ linked[/bold cyan] {_wikilink(source)} -> {_wikilink(target)}")
     for title in (deleted or []):

@@ -84,6 +84,72 @@ class TestSlugify:
         assert vault.slugify(text) == text
 
 
+class TestAppendToBody:
+    def test_text_lands_above_the_first_section(self, tmp_path):
+        vault.write_note(tmp_path, "project", "Foo", [], "original body", [])
+        path = vault.append_to_body(tmp_path, "02_Projects/Foo.md", "a defining detail")
+        text = path.read_text(encoding="utf-8")
+        assert text.index("a defining detail") < text.index("## Related")
+        assert "original body" in text
+
+    def test_existing_updates_section_is_untouched(self, tmp_path):
+        vault.write_note(tmp_path, "project", "Foo", [], "original body", [])
+        vault.append_update(tmp_path, "02_Projects/Foo.md", "an event")
+        path = vault.append_to_body(tmp_path, "02_Projects/Foo.md", "a detail")
+        text = path.read_text(encoding="utf-8")
+        assert "an event" in text
+        assert text.index("a detail") < text.index("## Updates")
+
+    def test_empty_text_changes_nothing(self, tmp_path):
+        vault.write_note(tmp_path, "project", "Foo", [], "original body", [])
+        before = (tmp_path / "02_Projects" / "Foo.md").read_text(encoding="utf-8")
+        vault.append_to_body(tmp_path, "02_Projects/Foo.md", "   ")
+        assert (tmp_path / "02_Projects" / "Foo.md").read_text(encoding="utf-8") == before
+
+    def test_missing_target_raises(self, tmp_path):
+        with pytest.raises(FileNotFoundError):
+            vault.append_to_body(tmp_path, "02_Projects/Nope.md", "x")
+
+
+class TestRenameNote:
+    def test_file_is_renamed_and_frontmatter_and_heading_follow(self, tmp_path):
+        vault.write_note(tmp_path, "project", "Old Title", [], "body", [])
+        path = vault.rename_note(tmp_path, "02_Projects/Old Title.md", "New Title")
+        assert path.name == "New Title.md"
+        assert not (tmp_path / "02_Projects" / "Old Title.md").exists()
+        text = path.read_text(encoding="utf-8")
+        assert 'title: "New Title"' in text
+        assert "# New Title" in text
+
+    def test_inbound_wikilinks_are_repointed(self, tmp_path):
+        # Obsidian resolves links by filename, so a rename that left these
+        # alone would silently break every existing reference.
+        vault.write_note(tmp_path, "project", "Old Title", [], "body", [])
+        vault.write_note(tmp_path, "concept", "Other", [], "body", ["Old Title"])
+        vault.rename_note(tmp_path, "02_Projects/Old Title.md", "New Title")
+        other = (tmp_path / "01_Concepts" / "Other.md").read_text(encoding="utf-8")
+        assert "[[New Title]]" in other
+        assert "[[Old Title]]" not in other
+
+    def test_rename_onto_a_taken_filename_is_refused(self, tmp_path):
+        # Merging two notes is not what a retitle asked for, and the
+        # no-duplicate-filenames invariant has to hold either way.
+        vault.write_note(tmp_path, "project", "Old Title", [], "body one", [])
+        vault.write_note(tmp_path, "concept", "Taken", [], "body two", [])
+        path = vault.rename_note(tmp_path, "02_Projects/Old Title.md", "Taken")
+        assert path.name == "Old Title.md"
+        assert (tmp_path / "01_Concepts" / "Taken.md").read_text(encoding="utf-8").count("body two") == 1
+
+    def test_renaming_to_the_same_slug_is_a_noop(self, tmp_path):
+        vault.write_note(tmp_path, "project", "Foo", [], "body", [])
+        path = vault.rename_note(tmp_path, "02_Projects/Foo.md", "Foo")
+        assert path.name == "Foo.md"
+
+    def test_missing_target_raises(self, tmp_path):
+        with pytest.raises(FileNotFoundError):
+            vault.rename_note(tmp_path, "02_Projects/Nope.md", "X")
+
+
 class TestNoDuplicateFilenames:
     """A filename may never be taken twice. Reported directly: the old
     numeric-suffix disambiguation produced an "Idea Agent Project" /

@@ -77,6 +77,12 @@ instruction, NOT an unclear one: "all" is precise about scope even though it nam
 Set "note_type" to "concept", "project", "entity", or "log" when the instruction limits itself
 to one of those kinds ("delete all my logs" -> "log"); set it to null when it means everything.
 
+CRITICAL: "delete_all" means literally EVERY note (or every note of one named type) and nothing
+less. If the instruction QUALIFIES which notes -- "the old ones", "the useless ones", "the
+duplicates", "the ones about X", "the ones I don't need" -- that is a SUBSET you have no way to
+identify, and it is NOT delete_all. Deleting everything when the user meant a handful is the
+worst mistake you can make here. Those go to "ask".
+
 Produce "add_to" when the instruction asks to PUT SOME CONTENT INTO an existing note -- a URL,
 a link, a fact, a detail, a reminder: "add this link to my X project", "put this under X", "save
 this reference in X", "add that to X", "keep this in X". This is the action for content the user
@@ -95,10 +101,20 @@ Do NOT use "link" for this. "link" is only for making one existing note referenc
 existing note; it cannot store a URL or any other text. If the instruction gives you content to
 save rather than naming two existing notes, it is "add_to".
 
-Still respond "unclear" for scope words that are genuinely fuzzy about WHICH notes rather than
-meaning all of them -- "delete the old notes", "delete the useless ones", "clean up", "organize
-my vault", "delete the duplicates". Those describe a judgment call you cannot verify; "all" does
-not.
+When the instruction is a real vault instruction but you cannot safely pin down exactly what it
+means, produce "ask" with a short, specific question that would resolve it -- do NOT guess, and
+do NOT give up. You are an assistant having a conversation, not a parser: asking is always
+better than refusing. Use it for any instruction that names a SUBSET you cannot identify --
+"delete the old notes", "delete the useless ones", "delete the duplicates", "clean up",
+"organize my vault" -- for a named note that doesn't match anything in the list, and for
+anything that could plausibly mean two or more different notes. A qualified subset is an "ask",
+never a "delete_all": ask which ones they mean.
+- Make the question answerable in one short reply. Name the real candidates when there are only
+  a few ("Do you mean X or Y?"), and say what you'd be acting on.
+- Never ask about something you already know; only ask for what's actually missing.
+
+Reserve "unclear" for input that is not an actionable vault instruction at all and no answer
+would fix.
 
 You may be given recent conversation from this session. If the instruction uses "it"/"that"/
 "the one I just mentioned"/"the same project we talked about" and the recent conversation
@@ -112,6 +128,7 @@ Respond with ONLY a JSON object, one of:
 {"action": "delete_all", "note_type": str or null}
 {"action": "link", "source": str, "target": str}
 {"action": "add_to", "target": str, "text": str}
+{"action": "ask", "question": str}
 {"action": "unclear"}
 """
 
@@ -194,6 +211,67 @@ Respond with ONLY a JSON object:
 {"redundant": true or false}
 """
 
+APPEND_TEXT_SYSTEM_PROMPT = """You are given something the user typed that is about to be saved
+into one of their existing notes. Return the CONTENT worth storing, with the wording that was
+addressed to the note-filing tool stripped out.
+
+Strip only the request wrapper -- phrases like "add this to my X project", "keep this as a
+reference in X", "put that in X", "save this", "note that", "remember". Those are how the user
+told the tool what to do; they are not part of what they wanted written down.
+
+Keep everything that is substance: URLs, facts, names, numbers, dates, technical details, and
+any wording that carries meaning about the thing itself. Copy the substance VERBATIM -- never
+summarize it, shorten it, rephrase it, correct its spelling, or add to it.
+
+If the whole thing is substance, return it unchanged. When unsure whether a phrase is substance
+or request wrapper, KEEP it: a few extra words in a note are harmless, losing information is
+not.
+
+Respond with ONLY a JSON object:
+{"text": str}
+"""
+
+PLACEMENT_SYSTEM_PROMPT = """You decide WHERE in an existing note some new content belongs.
+
+"body" -- it belongs to what the note IS. It defines, describes, or corrects the subject
+itself: a reference URL for the project, a clarification of what the thing does, a detail that
+a reader needs in order to understand the note at all. Someone reading the note top to bottom
+should meet this immediately, not in a dated log at the bottom.
+
+"updates" -- it belongs to what HAPPENED to the subject since. A change, a milestone, a new
+capability, a status, a decision made on a date. It reads naturally as "on this date, this
+became true" and would clutter the description if it sat in the body.
+
+Prefer "body" for reference material and defining detail; prefer "updates" for events and
+progress. When genuinely torn, choose "updates" -- it is the reversible, non-intrusive spot.
+
+Respond with ONLY a JSON object:
+{"placement": "body" or "updates"}
+"""
+
+RETITLE_SYSTEM_PROMPT = """You judge whether an existing note's title should be improved, given
+what the note now contains.
+
+Default to null. Renaming a note rewrites its filename and every link pointing at it, so it has
+a real cost -- only worth paying when the current title is genuinely bad.
+
+Genuinely bad means: cryptic or meaningless, a mangled fragment of a sentence, containing a
+typo, padded with filler, or no longer describing what the note is actually about.
+
+A good title is MINIMAL and UNDERSTANDABLE: the shortest phrase a person could read a year from
+now and know what's inside. Usually 2-5 plain words, and always SHORTER than what it replaces --
+if your proposal is longer than the current title, it is not an improvement, so return null
+instead. Drop filler words ("new", "a", "the", "my", "for", "of"), dates, and padding like
+"Notes on" / "Overview of". No trailing punctuation.
+
+A title that is merely lowercase, hyphenated, or slug-like is NOT bad -- that's just how it was
+written down, it still reads fine, and renaming it churns links for nothing. Leave it alone.
+Never change what the note is ABOUT.
+
+Respond with ONLY a JSON object:
+{"title": str or null}
+"""
+
 ATOMIZE_SYSTEM_PROMPT = """You decompose a raw capture into atomic notes for a technical
 Obsidian vault. The capture has already been confirmed to NOT duplicate any existing note.
 
@@ -237,7 +315,10 @@ in the title or body.
 
 WRITING STYLE:
 - Information-dense, concise, technical. No fluff, no filler sentences.
-- title: specific and descriptive, not a broad category name.
+- title: MINIMAL and UNDERSTANDABLE -- the shortest phrase someone could read a year from now
+  and know what's inside. Usually 2-5 plain words. Specific, not a broad category name, but
+  never a mangled fragment of the user's sentence either. No dates, no filler, no "Notes on" /
+  "Overview of" padding, no trailing punctuation.
 - tags: 1-4 short lowercase-hyphenated tags.
 - body: 1-4 sentences. State only what the capture actually said; do not add facts, numbers,
   or specifics the user did not provide.
@@ -311,6 +392,20 @@ def _format_session_history(session_history: list[dict]) -> str:
     )
 
 
+def _format_clarification(clarification: str) -> str:
+    """The user's answer to a question this tool just asked them. Folded into
+    the command-parse prompt so the follow-up parse sees both the original
+    instruction and the answer that disambiguated it, rather than trying to
+    interpret a bare "the second one" on its own."""
+    if not clarification:
+        return ""
+    return (
+        f'\nYou asked the user to clarify, and they answered: "{clarification.strip()}"\n'
+        f'Treat that answer as authoritative for resolving the instruction below. If it now\n'
+        f'identifies what to act on, act -- do not ask again.\n'
+    )
+
+
 def _call_meta_check(capture_text: str, known_titles: list[str], session_history: list[dict] = None) -> dict:
     prompt = (
         f"Existing note titles:\n{_titles_block(known_titles)}\n"
@@ -326,10 +421,12 @@ def _call_meta_check(capture_text: str, known_titles: list[str], session_history
     return json.loads(response["message"]["content"])
 
 
-def _call_command_parse(capture_text: str, known_titles: list[str], session_history: list[dict] = None) -> dict:
+def _call_command_parse(capture_text: str, known_titles: list[str], session_history: list[dict] = None,
+                         clarification: str = None) -> dict:
     prompt = (
         f"Existing note titles:\n{_titles_block(known_titles)}\n"
-        f"{_format_session_history(session_history)}\nInstruction:\n{capture_text}"
+        f"{_format_session_history(session_history)}"
+        f"{_format_clarification(clarification)}\nInstruction:\n{capture_text}"
     )
     response = ollama.chat(
         model=config.OLLAMA_MODEL, format="json",
@@ -385,6 +482,128 @@ def _call_redundant_check(capture_text: str, target: dict, session_history: list
         ],
     )
     return json.loads(response["message"]["content"])
+
+
+def _call_append_text(capture_text: str, target: dict) -> dict:
+    prompt = (
+        f'This is being saved into the note "{target["title"]}".\n\nThe user typed:\n{capture_text}'
+    )
+    response = ollama.chat(
+        model=config.OLLAMA_MODEL, format="json",
+        messages=[
+            {"role": "system", "content": APPEND_TEXT_SYSTEM_PROMPT},
+            {"role": "user", "content": prompt},
+        ],
+    )
+    return json.loads(response["message"]["content"])
+
+
+_WORD_RE = re.compile(r"\w+", re.UNICODE)
+
+
+def _extract_append_text(capture_text: str, target: dict) -> str:
+    """The substance of a capture, minus the instruction wrapper aimed at the
+    tool. Reported live: "<url> THIS TO MY metadata extraction project" was
+    filed with the instruction wording included, when only the URL was
+    wanted.
+
+    Verified rather than trusted: the result is rejected unless every word in
+    it also appears in the original, which catches the real failure mode
+    here (the model paraphrasing, summarizing, or "fixing" a typo instead of
+    extracting) and falls back to the raw capture. Extraction can only ever
+    lose information, so every failure path keeps the full text."""
+    original = capture_text.strip()
+    try:
+        result = _call_append_text(original, target)
+        if not isinstance(result, dict):
+            return original
+        extracted = _as_str(result.get("text"), "")
+        if not extracted:
+            return original
+        original_words = set(_WORD_RE.findall(original.lower()))
+        if not set(_WORD_RE.findall(extracted.lower())) <= original_words:
+            return original  # rephrased/invented rather than extracted
+        return extracted
+    except Exception:
+        return original
+
+
+def _call_placement(text: str, target: dict) -> dict:
+    prompt = (
+        f'Note: "{target["title"]}" (type: {target.get("type", "concept")})\n'
+        f'What it currently says: {target.get("excerpt", "")}\n\nNew content to place:\n{text}'
+    )
+    response = ollama.chat(
+        model=config.OLLAMA_MODEL, format="json",
+        messages=[
+            {"role": "system", "content": PLACEMENT_SYSTEM_PROMPT},
+            {"role": "user", "content": prompt},
+        ],
+    )
+    return json.loads(response["message"]["content"])
+
+
+def _choose_placement(text: str, target: dict) -> str:
+    """"body" or "updates". Defaults to "updates" on any failure -- a dated
+    bullet at the bottom is the unintrusive choice, and the one this tool did
+    unconditionally before it could decide at all."""
+    try:
+        result = _call_placement(text, target)
+        if isinstance(result, dict) and _as_str(result.get("placement"), "") == "body":
+            return "body"
+    except Exception:
+        pass
+    return "updates"
+
+
+def _call_retitle(target: dict, added_text: str) -> dict:
+    prompt = (
+        f'Current title: "{target["title"]}"\n'
+        f'What the note says: {target.get("excerpt", "")}\n'
+        f'Just added to it: {added_text}'
+    )
+    response = ollama.chat(
+        model=config.OLLAMA_MODEL, format="json",
+        messages=[
+            {"role": "system", "content": RETITLE_SYSTEM_PROMPT},
+            {"role": "user", "content": prompt},
+        ],
+    )
+    return json.loads(response["message"]["content"])
+
+
+MAX_TITLE_WORDS = 8
+MIN_EXPANDABLE_WORDS = 4  # a 1-2 word cryptic title may grow this far, nothing else may grow
+
+
+def _better_title(target: dict, added_text: str) -> str | None:
+    """A genuinely better title for a note just written to, or None.
+
+    Guarded rather than trusted: a retitle rewrites the filename and every
+    inbound link, so a bad one is disruptive in a way an extra Updates line
+    is not. Rejects anything empty, unchanged, or over-long -- and, since
+    "minimal" is the stated bar, anything WORDIER than the title it would
+    replace. Caught live: "github-repo-data-collection" (already fine) was
+    "improved" to the longer "New GitHub Repo for Data Collection", which is
+    churn, not a gain. A very short cryptic title is the one case where
+    growing is legitimate, so titles of 1-2 words may expand up to
+    MIN_EXPANDABLE_WORDS."""
+    try:
+        result = _call_retitle(target, added_text)
+        if not isinstance(result, dict):
+            return None
+        title = _as_str(result.get("title"), "").strip().rstrip(".")
+        if not title or _normalize_title(title) == _normalize_title(target["title"]):
+            return None
+        if len(title.split()) > MAX_TITLE_WORDS or len(title) > 80:
+            return None
+        current_words = len(_normalize_title(target["title"]).split())
+        budget = max(current_words, MIN_EXPANDABLE_WORDS) if current_words <= 2 else current_words
+        if len(title.split()) > budget:
+            return None
+        return title
+    except Exception:
+        return None
 
 
 def _call_duplicate_check(capture_text: str, candidates: list[dict], session_history: list[dict] = None) -> dict:
@@ -692,7 +911,8 @@ def _confirm_delete(capture_text: str, target: dict, session_history: list[dict]
 
 
 def _parse_command(capture_text: str, known_notes: list[dict],
-                    session_history: list[dict] = None) -> dict | None:
+                    session_history: list[dict] = None,
+                    clarification: str = None) -> dict | None:
     """Returns a ready-to-execute command dict, or None if the instruction
     was too vague/ambiguous to safely act on (caller should refuse it, same
     as before this existed). known_notes is the FULL list of {"title","path"}
@@ -703,7 +923,7 @@ def _parse_command(capture_text: str, known_notes: list[dict],
     never fuzzy."""
     known_titles = [n["title"] for n in known_notes]
     try:
-        result = _call_command_parse(capture_text, known_titles, session_history)
+        result = _call_command_parse(capture_text, known_titles, session_history, clarification)
         if not isinstance(result, dict):
             return None
         action = str(result.get("action", "")).lower()
@@ -729,6 +949,10 @@ def _parse_command(capture_text: str, known_notes: list[dict],
             if not targets:
                 return None
             return {"action": "delete_all", "note_type": note_type, "targets": targets}
+
+        if action == "ask":
+            question = _as_str(result.get("question"), "")
+            return {"action": "ask", "question": question} if question else None
 
         if action == "add_to":
             target = _find_by_title(_as_str(result.get("target"), ""), known_notes)
@@ -758,8 +982,22 @@ def _parse_command(capture_text: str, known_notes: list[dict],
     return None
 
 
+def _append_item(capture_text: str, target: dict) -> dict:
+    """Build the append action: what to store, where in the note to put it,
+    and whether writing it makes the note's title worth improving."""
+    text = _extract_append_text(capture_text, target)
+    return {
+        "action": "append",
+        "target_path": target["path"],
+        "target_title": target["title"],
+        "text": text,
+        "placement": _choose_placement(text, target),
+        "new_title": _better_title(target, text),
+    }
+
+
 def process_capture(capture_text: str, candidates: list[dict], known_notes: list[dict] = None,
-                     session_history: list[dict] = None) -> list[dict]:
+                     session_history: list[dict] = None, clarification: str = None) -> list[dict]:
     """Returns a list of items, each one of:
     {"action": "create", "title", "type", "tags", "body", "links"},
     {"action": "append", "target_path", "target_title", "text"} -- a small
@@ -776,11 +1014,16 @@ def process_capture(capture_text: str, candidates: list[dict], known_notes: list
     list instead. Or
     {"action": "link", "source_path", "source_title", "target_path", "target_title"}
     -- an unambiguous, confirmed vault-management instruction, or
-    {"action": "not_content"} -- the capture was an instruction, but too
-    vague/ambiguous to safely act on (named no real note, could mean more
-    than one, etc.) -- refused rather than guessed at. Caught live: "make
-    me a file that..." and "edit that file and add..." were both filed as
-    nonsense notes about themselves before instruction-detection existed.
+    {"action": "ask", "question"} -- a real vault instruction that couldn't
+    be pinned down safely, so it asks instead of guessing OR refusing. The
+    caller is expected to put the question to the user and call again with
+    their reply as `clarification`. Requested directly: "make sure that the
+    ai knows he is an ai not just a note taker so let him ask me questions
+    if not sure". Only one round -- a second unresolved pass refuses, or
+    {"action": "not_content"} -- not an actionable vault instruction at all,
+    and no answer would fix it. Caught live: "make me a file that..." and
+    "edit that file and add..." were both filed as nonsense notes about
+    themselves before instruction-detection existed.
 
     session_history is this REPL session's short-term memory (recent
     {"capture", "summary"} turns, oldest first) -- lets a pronoun-only
@@ -794,7 +1037,12 @@ def process_capture(capture_text: str, candidates: list[dict], known_notes: list
     known_notes = known_notes or []
     known_titles = [n["title"] for n in known_notes]
     if _is_meta_command(capture_text, known_titles, session_history):
-        command = _parse_command(capture_text, known_notes, session_history)
+        command = _parse_command(capture_text, known_notes, session_history, clarification)
+        # One question per capture. If the answer still didn't resolve it,
+        # refuse rather than starting an interrogation -- the user came here
+        # to save a thought, not to play twenty questions.
+        if command and command["action"] == "ask" and clarification:
+            return [{"action": "not_content"}]
         return [command] if command else [{"action": "not_content"}]
     duplicate_of = _check_duplicate(capture_text, candidates, session_history)
     if duplicate_of:
@@ -812,10 +1060,7 @@ def process_capture(capture_text: str, candidates: list[dict], known_notes: list
         # of this tool is not losing ideas.
         dup_note = next((c for c in candidates if c["title"] == duplicate_of), None)
         if dup_note and not _is_redundant_update(capture_text, dup_note, session_history):
-            return [{
-                "action": "append", "target_path": dup_note["path"],
-                "target_title": dup_note["title"], "text": capture_text.strip(),
-            }]
+            return [_append_item(capture_text, dup_note)]
         return [{"action": "duplicate", "duplicate_of": duplicate_of, "note": ""}]
     append_target = _check_append(capture_text, candidates, session_history)
     if append_target:
@@ -829,8 +1074,5 @@ def process_capture(capture_text: str, candidates: list[dict], known_notes: list
         # line added to the existing note either.
         if _is_redundant_update(capture_text, append_target, session_history):
             return [{"action": "duplicate", "duplicate_of": append_target["title"], "note": ""}]
-        return [{
-            "action": "append", "target_path": append_target["path"],
-            "target_title": append_target["title"], "text": capture_text.strip(),
-        }]
+        return [_append_item(capture_text, append_target)]
     return _atomize(capture_text, candidates, session_history)

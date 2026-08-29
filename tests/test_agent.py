@@ -57,6 +57,14 @@ def add_to_command_response(target, text):
     return chat_returning({"action": "add_to", "target": target, "text": text})
 
 
+def ask_command_response(question):
+    return chat_returning({"action": "ask", "question": question})
+
+
+def append_text_response(text):
+    return chat_returning({"text": text})
+
+
 def confirm_response(confirmed):
     return chat_returning({"confirmed": confirmed})
 
@@ -236,12 +244,14 @@ class TestDuplicateDetection:
             not_instruction_response(),
             dup_response("Existing Note"),
             no_redundant_response(),  # one dissent is enough: it adds something new
+            append_text_response("https://example.com/api reference for it"),
         ])
         result = agent.process_capture("https://example.com/api reference for it", CANDIDATES)
         assert result == [{
             "action": "append", "target_path": "02_Projects/Existing Note.md",
             "target_title": "Existing Note",
             "text": "https://example.com/api reference for it",
+            "placement": "updates", "new_title": None,
         }]
 
     def test_duplicate_of_an_uncarried_candidate_still_drops_safely(self, mocker):
@@ -622,11 +632,13 @@ class TestAppendToExisting:
             no_dup_response(), no_dup_response(), no_dup_response(),
             append_response("Existing Note"),
             no_redundant_response(),
+            append_text_response("Existing Note now does X too"),
         ])
         result = agent.process_capture("Existing Note now does X too", self.STRONG)
         assert result == [{
             "action": "append", "target_path": "02_Projects/Existing Note.md",
             "target_title": "Existing Note", "text": "Existing Note now does X too",
+            "placement": "updates", "new_title": None,
         }]
 
     def test_no_candidates_skips_append_check_entirely(self, mocker):
@@ -751,6 +763,210 @@ class TestAppendToExisting:
         ])
         result = agent.process_capture("idea", self.STRONG)
         assert result[0]["action"] == "create"
+
+
+class TestAppendTextExtraction:
+    """Reported live: "<url> THIS TO MY metadata axtracti0on project" was
+    saved into the note with the instruction wording attached, when only the
+    URL was wanted. The stored text should be the substance, not the request
+    that carried it."""
+
+    TARGET = {"title": "Existing Note", "type": "project",
+              "path": "02_Projects/Existing Note.md", "score": 0.9, "excerpt": "x"}
+
+    def test_instruction_wrapper_is_stripped(self, mocker):
+        mocker.patch.object(agent.ollama, "chat",
+                             return_value=append_text_response("https://example.com/x"))
+        text = agent._extract_append_text(
+            "https://example.com/x add this to my project", self.TARGET)
+        assert text == "https://example.com/x"
+
+    def test_pure_content_is_returned_unchanged(self, mocker):
+        mocker.patch.object(agent.ollama, "chat",
+                             return_value=append_text_response("it now supports bulk delete"))
+        text = agent._extract_append_text("it now supports bulk delete", self.TARGET)
+        assert text == "it now supports bulk delete"
+
+    def test_paraphrase_is_rejected_in_favor_of_the_original(self, mocker):
+        # Extraction may only remove words, never introduce them. A model
+        # that summarizes or "fixes" wording gets discarded -- losing the
+        # user's actual words is worse than keeping a few extra ones.
+        mocker.patch.object(agent.ollama, "chat",
+                             return_value=append_text_response("supports deleting things in bulk"))
+        original = "it now supports bulk delete"
+        assert agent._extract_append_text(original, self.TARGET) == original
+
+    def test_typo_correction_is_rejected(self, mocker):
+        # "axtracti0on" -> "extraction" introduces a word that wasn't typed.
+        mocker.patch.object(agent.ollama, "chat",
+                             return_value=append_text_response("my metadata extraction project"))
+        original = "my metadata axtracti0on project"
+        assert agent._extract_append_text(original, self.TARGET) == original
+
+    def test_empty_extraction_falls_back_to_the_original(self, mocker):
+        mocker.patch.object(agent.ollama, "chat", return_value=append_text_response(""))
+        assert agent._extract_append_text("some content", self.TARGET) == "some content"
+
+    def test_exception_falls_back_to_the_original(self, mocker):
+        mocker.patch.object(agent.ollama, "chat", side_effect=Exception("boom"))
+        assert agent._extract_append_text("some content", self.TARGET) == "some content"
+
+    def test_append_action_stores_the_extracted_text(self, mocker):
+        mocker.patch.object(agent.ollama, "chat", side_effect=[
+            not_instruction_response(),
+            no_dup_response(), no_dup_response(), no_dup_response(),
+            append_response("Existing Note"),
+            no_redundant_response(),
+            append_text_response("https://example.com/x"),
+        ])
+        result = agent.process_capture(
+            "https://example.com/x add this to my project", [self.TARGET])
+        assert result[0]["text"] == "https://example.com/x"
+
+
+class TestPlacementAndRetitle:
+    """Requested directly: "let him decide when to write in updates and when
+    to not write in updates and if he feels like theree is a better title
+    then let him change it and always make it minial and understandable"."""
+
+    TARGET = {"title": "Old Title", "type": "project",
+              "path": "02_Projects/Old Title.md", "score": 0.9, "excerpt": "x"}
+
+    def test_body_placement_is_honoured(self, mocker):
+        mocker.patch.object(agent.ollama, "chat",
+                             return_value=chat_returning({"placement": "body"}))
+        assert agent._choose_placement("a defining detail", self.TARGET) == "body"
+
+    def test_updates_placement_is_honoured(self, mocker):
+        mocker.patch.object(agent.ollama, "chat",
+                             return_value=chat_returning({"placement": "updates"}))
+        assert agent._choose_placement("shipped a thing", self.TARGET) == "updates"
+
+    def test_unrecognized_placement_defaults_to_updates(self, mocker):
+        mocker.patch.object(agent.ollama, "chat",
+                             return_value=chat_returning({"placement": "sidebar"}))
+        assert agent._choose_placement("x", self.TARGET) == "updates"
+
+    def test_placement_exception_defaults_to_updates(self, mocker):
+        mocker.patch.object(agent.ollama, "chat", side_effect=Exception("boom"))
+        assert agent._choose_placement("x", self.TARGET) == "updates"
+
+    def test_a_better_title_is_proposed(self, mocker):
+        mocker.patch.object(agent.ollama, "chat",
+                             return_value=chat_returning({"title": "GitHub Metadata Extraction"}))
+        assert agent._better_title(self.TARGET, "x") == "GitHub Metadata Extraction"
+
+    def test_null_means_the_title_is_already_fine(self, mocker):
+        mocker.patch.object(agent.ollama, "chat", return_value=chat_returning({"title": None}))
+        assert agent._better_title(self.TARGET, "x") is None
+
+    def test_an_unchanged_title_is_not_a_retitle(self, mocker):
+        mocker.patch.object(agent.ollama, "chat",
+                             return_value=chat_returning({"title": "old title"}))
+        assert agent._better_title(self.TARGET, "x") is None
+
+    def test_a_verbose_title_is_rejected(self, mocker):
+        # "Minimal and understandable" is the requirement, so a long-winded
+        # rewrite is a failure rather than an improvement.
+        long_title = "Notes On The GitHub Repository Metadata Extraction Learning Project For Research"
+        mocker.patch.object(agent.ollama, "chat", return_value=chat_returning({"title": long_title}))
+        assert agent._better_title(self.TARGET, "x") is None
+
+    def test_a_longer_title_is_rejected_as_churn(self, mocker):
+        # Caught live: "github-repo-data-collection" was already fine and got
+        # "improved" into the longer "New GitHub Repo for Data Collection" --
+        # more words is not more minimal, and a rename churns every link.
+        target = {"title": "github-repo-data-collection", "type": "project",
+                  "path": "p.md", "score": 0.9, "excerpt": "x"}
+        mocker.patch.object(agent.ollama, "chat", return_value=chat_returning(
+            {"title": "New GitHub Repo for Data Collection"}))
+        assert agent._better_title(target, "x") is None
+
+    def test_a_shorter_title_is_still_accepted(self, mocker):
+        target = {"title": "github-repo-data-collection", "type": "project",
+                  "path": "p.md", "score": 0.9, "excerpt": "x"}
+        mocker.patch.object(agent.ollama, "chat",
+                             return_value=chat_returning({"title": "GitHub Metadata"}))
+        assert agent._better_title(target, "x") == "GitHub Metadata"
+
+    def test_a_cryptic_short_title_may_grow_a_little(self, mocker):
+        target = {"title": "stuff", "type": "project", "path": "p.md",
+                  "score": 0.9, "excerpt": "x"}
+        mocker.patch.object(agent.ollama, "chat",
+                             return_value=chat_returning({"title": "GitHub Metadata Extraction"}))
+        assert agent._better_title(target, "x") == "GitHub Metadata Extraction"
+
+    def test_retitle_exception_leaves_the_title_alone(self, mocker):
+        mocker.patch.object(agent.ollama, "chat", side_effect=Exception("boom"))
+        assert agent._better_title(self.TARGET, "x") is None
+
+    def test_append_item_carries_placement_and_new_title(self, mocker):
+        mocker.patch.object(agent.ollama, "chat", side_effect=[
+            not_instruction_response(),
+            no_dup_response(), no_dup_response(), no_dup_response(),
+            append_response("Old Title"),
+            no_redundant_response(),
+            append_text_response("https://example.com/x"),
+            chat_returning({"placement": "body"}),
+            chat_returning({"title": "Metadata Extraction"}),
+        ])
+        result = agent.process_capture("https://example.com/x add this", [self.TARGET])
+        assert result[0]["placement"] == "body"
+        assert result[0]["new_title"] == "Metadata Extraction"
+
+
+class TestAskWhenUnsure:
+    """Requested directly: "make sure that the ai knows he is an ai not just a
+    note taker so let him ask me questions if not sure". An ambiguous vault
+    instruction asks rather than flatly refusing."""
+
+    def test_ambiguous_instruction_asks_a_question(self, mocker):
+        mocker.patch.object(agent.ollama, "chat", side_effect=[
+            instruction_response(), instruction_response(), instruction_response(),
+            ask_command_response("Do you mean Old Note or Other Note?"),
+        ])
+        result = agent.process_capture("delete that note", [], KNOWN_NOTES)
+        assert result == [{
+            "action": "ask", "question": "Do you mean Old Note or Other Note?",
+        }]
+
+    def test_clarification_resolves_the_instruction(self, mocker):
+        mocker.patch.object(agent.ollama, "chat", side_effect=[
+            instruction_response(), instruction_response(), instruction_response(),
+            delete_command_response("Old Note"),
+            confirm_response(True), confirm_response(True), confirm_response(True),
+        ])
+        result = agent.process_capture(
+            "delete that note", [], KNOWN_NOTES, clarification="the old one")
+        assert result[0]["action"] == "delete"
+        assert result[0]["target_title"] == "Old Note"
+
+    def test_the_answer_reaches_the_parse_prompt(self, mocker):
+        spy = mocker.patch.object(agent.ollama, "chat", side_effect=[
+            instruction_response(), instruction_response(), instruction_response(),
+            unclear_command_response(),
+        ])
+        agent.process_capture("delete that note", [], KNOWN_NOTES, clarification="the old one")
+        assert "the old one" in spy.call_args_list[3].kwargs["messages"][1]["content"]
+
+    def test_it_will_not_ask_twice_for_the_same_capture(self, mocker):
+        # Already answered once and still ambiguous -- refuse rather than
+        # start an interrogation.
+        mocker.patch.object(agent.ollama, "chat", side_effect=[
+            instruction_response(), instruction_response(), instruction_response(),
+            ask_command_response("Which one though?"),
+        ])
+        result = agent.process_capture(
+            "delete that note", [], KNOWN_NOTES, clarification="the old one")
+        assert result == [{"action": "not_content"}]
+
+    def test_ask_without_a_question_is_refused(self, mocker):
+        mocker.patch.object(agent.ollama, "chat", side_effect=[
+            instruction_response(), instruction_response(), instruction_response(),
+            ask_command_response(""),
+        ])
+        result = agent.process_capture("delete that note", [], KNOWN_NOTES)
+        assert result == [{"action": "not_content"}]
 
 
 class TestAtomize:

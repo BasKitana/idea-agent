@@ -269,6 +269,91 @@ class TestProcessCapture:
 
         assert "01_Concepts/Old Note.md" not in index.data
 
+    def test_body_placement_writes_above_the_sections(self, mocker, vault_path):
+        vault.write_note(vault_path, "project", "Foo", [], "original body", [])
+        index = RagIndex()
+        mocker.patch.object(agent, "process_capture", return_value=[{
+            "action": "append", "target_path": "02_Projects/Foo.md",
+            "target_title": "Foo", "text": "a defining detail",
+            "placement": "body", "new_title": None,
+        }])
+        main.process_capture("a defining detail", index)
+        text = (vault_path / "02_Projects" / "Foo.md").read_text(encoding="utf-8")
+        assert text.index("a defining detail") < text.index("## Related")
+        assert "## Updates" not in text
+
+    def test_retitle_renames_the_file_and_reindexes(self, mocker, vault_path):
+        vault.write_note(vault_path, "project", "Old Title", [], "body", [])
+        index = RagIndex()
+        index.data["02_Projects/Old Title.md"] = {
+            "mtime": 1, "title": "Old Title", "type": "project", "embedding": [0],
+        }
+        mocker.patch.object(agent, "process_capture", return_value=[{
+            "action": "append", "target_path": "02_Projects/Old Title.md",
+            "target_title": "Old Title", "text": "a new fact",
+            "placement": "updates", "new_title": "New Title",
+        }])
+        with main.console.capture() as captured:
+            main.process_capture("a new fact", index)
+
+        assert (vault_path / "02_Projects" / "New Title.md").exists()
+        assert not (vault_path / "02_Projects" / "Old Title.md").exists()
+        assert "02_Projects/Old Title.md" not in index.data  # stale entry cleared
+        assert "02_Projects/New Title.md" in index.data
+        assert "~ retitled" in captured.get()
+
+    def test_refused_retitle_leaves_everything_on_the_original(self, mocker, vault_path):
+        vault.write_note(vault_path, "project", "Old Title", [], "body", [])
+        vault.write_note(vault_path, "concept", "Taken", [], "other", [])
+        index = RagIndex()
+        mocker.patch.object(agent, "process_capture", return_value=[{
+            "action": "append", "target_path": "02_Projects/Old Title.md",
+            "target_title": "Old Title", "text": "a new fact",
+            "placement": "updates", "new_title": "Taken",
+        }])
+        with main.console.capture() as captured:
+            main.process_capture("a new fact", index)
+
+        assert (vault_path / "02_Projects" / "Old Title.md").exists()
+        assert "~ retitled" not in captured.get()
+        assert "a new fact" in (vault_path / "02_Projects" / "Old Title.md").read_text(encoding="utf-8")
+
+    def test_ask_puts_the_question_to_the_user_and_acts_on_the_answer(self, mocker, vault_path):
+        index = RagIndex()
+        agent_calls = []
+
+        def fake_agent(capture_text, candidates, known_notes, history, clarification=None):
+            agent_calls.append(clarification)
+            if clarification is None:
+                return [{"action": "ask", "question": "Which project do you mean?"}]
+            return [{"action": "create", "title": "X", "type": "concept",
+                     "tags": [], "body": "b", "links": []}]
+
+        mocker.patch.object(agent, "process_capture", side_effect=fake_agent)
+        main.process_capture("add it there", index, [], ask=lambda q: "the metadata one")
+
+        assert agent_calls == [None, "the metadata one"]  # asked, then re-ran with the answer
+        assert (vault_path / "01_Concepts" / "X.md").exists()
+
+    def test_declining_to_answer_files_nothing(self, mocker, vault_path):
+        index = RagIndex()
+        mocker.patch.object(agent, "process_capture", return_value=[
+            {"action": "ask", "question": "Which one?"},
+        ])
+        session_history = []
+        with main.console.capture() as captured:
+            main.process_capture("add it there", index, session_history, ask=lambda q: "")
+
+        assert "instruction I can't safely act on" in captured.get()
+        assert list(vault_path.glob("**/*.md")) == []
+        assert session_history[-1]["subject"] is None
+
+    def test_the_question_text_is_shown_to_the_user(self, vault_path, mocker):
+        mocker.patch.object(main.console, "input", return_value="")
+        with main.console.capture() as captured:
+            main.ask_user("Do you mean Old Note or Other Note?")
+        assert "Do you mean Old Note or Other Note?" in captured.get()
+
     def test_create_colliding_with_an_existing_note_merges_and_reports_updated(self, mocker, vault_path):
         # No "X (2).md" twin, and the summary must say "updated", not
         # "created" -- reporting a merge as a creation would misdescribe the

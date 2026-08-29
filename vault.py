@@ -179,6 +179,90 @@ def append_update(vault_path: Path, rel_path: str, text: str) -> Path:
     return path
 
 
+_SECTION_RE = re.compile(r"^## ", re.MULTILINE)
+
+
+def append_to_body(vault_path: Path, rel_path: str, text: str) -> Path:
+    """Add a sentence to the note's main body -- the prose under the H1,
+    before the first "## " section -- rather than as a dated Updates bullet.
+
+    For content that belongs to what the note *is* rather than to what
+    happened to it since. Still purely additive: nothing already written is
+    rewritten or removed."""
+    path = vault_path / rel_path
+    if not path.exists():
+        raise FileNotFoundError(f"{rel_path} no longer exists")
+
+    existing = path.read_text(encoding="utf-8")
+    addition = text.strip()
+    if not addition:
+        return path
+
+    match = _SECTION_RE.search(existing)
+    if match:
+        head, tail = existing[:match.start()], existing[match.start():]
+        new_content = head.rstrip("\n") + f"\n{addition}\n\n" + tail
+    else:
+        new_content = existing.rstrip("\n") + f"\n{addition}\n"
+
+    path.write_text(new_content, encoding="utf-8")
+    return path
+
+
+def rename_note(vault_path: Path, rel_path: str, new_title: str) -> Path:
+    """Retitle a note and repoint every [[wikilink]] in the vault at it.
+
+    Returns the note's path -- the new one, or the unchanged original when
+    the rename is refused. Refused rather than forced when the new filename
+    is already taken, since silently merging two notes is not what a retitle
+    asked for, and the no-duplicate-filenames invariant must hold either way.
+
+    Rewriting inbound links is not optional: Obsidian resolves links by
+    filename, so a rename without it would leave every existing reference
+    pointing at a file that no longer exists."""
+    path = vault_path / rel_path
+    if not path.exists():
+        raise FileNotFoundError(f"{rel_path} no longer exists")
+
+    old_slug = path.stem
+    new_slug = slugify(new_title)
+    if new_slug == old_slug:
+        return path
+    taken = find_existing_note(vault_path, new_title)
+    if taken and taken.resolve() != path.resolve():
+        return path
+
+    content = path.read_text(encoding="utf-8")
+    # [ \t]* rather than \s* throughout: \s matches newlines, so a greedy
+    # \s*$ swallows the blank line after the heading and glues the body onto
+    # it (caught live -- the H1 ended up directly above the first paragraph).
+    content = re.sub(
+        r"^title:[ \t]*.*$", f"title: {_yaml_quote(_clean_title(new_title))}",
+        content, count=1, flags=re.MULTILINE,
+    )
+    content = re.sub(
+        rf"^#[ \t]+{re.escape(old_slug)}[ \t]*$", f"# {_clean_title(new_title)}",
+        content, count=1, flags=re.MULTILINE,
+    )
+    new_path = path.with_name(f"{new_slug}.md")
+    new_path.write_text(content, encoding="utf-8")
+    path.unlink()
+
+    link_re = re.compile(rf"\[\[{re.escape(old_slug)}(\|[^\]]*)?\]\]")
+    replacement = _wikilink(new_title)
+    for folder in config.FOLDER_BY_TYPE.values():
+        folder_path = vault_path / folder
+        if not folder_path.is_dir():
+            continue
+        for md in folder_path.glob("*.md"):
+            text = md.read_text(encoding="utf-8")
+            updated = link_re.sub(replacement.replace("\\", "\\\\"), text)
+            if updated != text:
+                md.write_text(updated, encoding="utf-8")
+
+    return new_path
+
+
 def add_link(vault_path: Path, rel_path: str, target_title: str, heading: str = "Related") -> Path:
     """Additively insert a wikilink to target_title into an existing note's
     section (creating the heading once if it isn't there yet). Idempotent --

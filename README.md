@@ -19,9 +19,10 @@ Bin, and anything too ambiguous to place safely is handed back to you rather tha
 Type a capture into the REPL and it checks whether you've already written about it, whether
 it's really an update to something you have, whether it covers more than one distinct subject,
 classifies each note into one of four types, and files it with proper frontmatter and links.
-You can also just tell it what to do -- "delete X", "link X to Y", "delete all my logs" --
-and it executes when the target is unambiguous, asks first when the action is destructive, and
-refuses when the instruction is too vague to act on safely.
+You can also just tell it what to do -- "delete X", "link X to Y", "add this link to my project",
+"delete all my logs" -- and it executes when the target is unambiguous, confirms first when the
+action is destructive, and asks you which notes you meant when the instruction could go more
+than one way, rather than guessing or giving up.
 
 Everything runs on-device: the LLM is a local [Ollama](https://ollama.com) model, embeddings
 are a local `sentence-transformers` model, and the retrieval index is a plain JSON file. No
@@ -80,13 +81,42 @@ of that measurement, not out of guessing:
   deliberately the one destructive path with no LLM confirmation vote: those votes exist to
   check "did I identify the right single note", and an all-scoped delete has nothing of the
   sort to verify -- so the guard is the person seeing the real file list and typing "yes" in
-  full. Genuinely fuzzy scopes ("delete the old notes", "clean up") are still refused, since
-  those describe a judgment call rather than a scope. Measured 21/21 across both phrasings,
-  type-scoped deletes, the vague controls, and single-title delete.
+  full. Genuinely fuzzy scopes ("delete the old notes", "clean up") name a subset it cannot
+  identify, so those ask which notes are meant rather than assuming everything. Measured 21/21
+  across both phrasings, type-scoped deletes, the vague controls, and single-title delete.
 - **Command targets must match a real existing title exactly (punctuation/case aside), never
   fuzzy or semantic matching.** Delete and link only ever act on a title the model copied
   verbatim from the vault's real note list; case/hyphen/spacing differences are normalized
   away, but a name that doesn't resolve to a real note is refused, not guessed at.
+- **What gets stored is the substance, not the request that carried it.** Reported live:
+  "&lt;url&gt; THIS TO MY metadata axtracti0on project" was saved into the note with the
+  instruction wording attached, when only the URL was wanted. A focused extraction step now
+  strips the wrapper ("add this to my X", "keep this as a reference in X") and keeps the rest.
+  It is verified rather than trusted: the result is rejected unless every word in it also
+  appears in the original, which catches the actual failure mode -- the model paraphrasing,
+  summarizing, or helpfully "fixing" a typo -- and falls back to the raw text. Extraction can
+  only ever lose information, so every failure path keeps everything. Measured 6/6 on the
+  instruction-wrapped phrasings, with pure content correctly left untouched 3/3.
+- **It asks when it isn't sure, instead of refusing.** Requested directly: "make sure that the
+  ai knows he is an ai not just a note taker so let him ask me questions if not sure". An
+  instruction that's real but ambiguous now comes back as a specific question naming the actual
+  candidates ("Do you mean X or Y?"), and the answer feeds a second parse. Exactly one round --
+  a still-unresolved second pass refuses rather than starting an interrogation. Widening this
+  had a sharp edge worth recording: moving the fuzzy-scope examples into the "ask" bucket made
+  "delete the old notes" parse as `delete_all` 3/3, offering to wipe the whole vault for a
+  request that meant a handful of notes. A qualified subset is now explicitly excluded from
+  `delete_all` in the prompt; re-measured at 3/3 asking, with the true all-scopes and exact-title
+  deletes unchanged.
+- **It decides where in a note new content belongs, and can retitle a note it just wrote to.**
+  Reference material and defining detail go into the body, where a reader meets them
+  immediately; events, milestones and status go under `## Updates` as dated bullets. Ties go to
+  Updates, the unintrusive spot. Retitling is deliberately conservative, because renaming
+  rewrites the filename and every inbound `[[wikilink]]`: a proposal is rejected if it's wordier
+  than the title it replaces, over 8 words, or merely a reformatting of a slug-like title that
+  reads fine already. Caught live -- "github-repo-data-collection" was "improved" into the
+  longer "New GitHub Repo for Data Collection", which is churn rather than a gain, so shorter is
+  now a hard requirement rather than a preference. A rename onto an already-taken filename is
+  refused outright, keeping the no-duplicate-filenames invariant intact.
 - **A filename can never be taken twice, and that one is guaranteed by code rather than by
   model judgment.** Everything else here about consolidation is the LLM exercising judgment,
   which means it is reliable-but-not-certain. This one isn't a judgment at all: `write_note`
@@ -239,7 +269,7 @@ pip install -r requirements-dev.txt
 pytest
 ```
 
-260 tests, no live Ollama server or network access required -- the embedding model and
+300 tests, no live Ollama server or network access required -- the embedding model and
 `ollama.chat` are mocked/faked for speed and determinism.
 
 ## Configuration
