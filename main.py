@@ -36,7 +36,13 @@ def check_ollama() -> str | None:
     return None
 
 
-def process_capture(capture_text: str, index: RagIndex):
+def process_capture(capture_text: str, index: RagIndex, session_history: list[dict] = None) -> None:
+    """session_history is mutated in place: this turn's outcome is appended
+    and the list is capped at SESSION_MEMORY_SIZE, so the caller's list
+    object reflects the growing short-term memory without needing to
+    reassign or unpack a return value."""
+    if session_history is None:
+        session_history = []
     candidates = index.query(
         capture_text, top_k=config.DEDUP_TOP_K, min_score=config.DEDUP_RETRIEVE_SCORE,
     )
@@ -44,7 +50,22 @@ def process_capture(capture_text: str, index: RagIndex):
         {"title": e["title"], "path": k, "type": e.get("type", "concept"), "excerpt": e.get("excerpt", "")}
         for k, e in index.data.items()
     ]
-    items = agent.process_capture(capture_text, candidates, known_notes)
+    # Session history helps the LLM's JUDGMENT once a candidate is already in
+    # view, but retrieval itself is pure embedding similarity on the raw
+    # text -- a pronoun-heavy follow-up like "it also uses Ollama" can score
+    # too low against the note "it" refers to for that note to ever become a
+    # candidate at all, so append/dedup never get a chance to consider it.
+    # Reported live. Carry the previous turn's subject note forward as a
+    # guaranteed strong candidate so continuity doesn't depend on embedding
+    # luck for a pronoun that carries almost no semantic content of its own.
+    if session_history:
+        subject_title = session_history[-1].get("subject")
+        if subject_title and not any(c["title"] == subject_title for c in candidates):
+            subject_note = next((n for n in known_notes if n["title"] == subject_title), None)
+            if subject_note:
+                candidates = candidates + [{**subject_note, "score": config.AUTO_LINK_SCORE}]
+
+    items = agent.process_capture(capture_text, candidates, known_notes, session_history)
 
     today = date.today().isoformat()
     created = []       # (title, path, links)
@@ -103,6 +124,49 @@ def process_capture(capture_text: str, index: RagIndex):
         )
 
     _print_summary(created, duplicates, failed, not_content, updated, deleted, linked)
+    summary = _history_summary(created, duplicates, updated, deleted, linked, failed, not_content)
+    subject = _history_subject(created, duplicates, updated, deleted, linked)
+    session_history.append({"capture": capture_text[:100], "summary": summary, "subject": subject})
+    del session_history[:-config.SESSION_MEMORY_SIZE]
+
+
+def _history_summary(created, duplicates, updated, deleted, linked, failed, not_content) -> str:
+    """One-line summary of what this capture actually did, stored as this
+    turn's short-term-memory entry so a later capture like "delete it" can
+    resolve what "it" was."""
+    parts = []
+    for title, _, note_type in created:
+        parts.append(f"filed '{title}' ({note_type})")
+    for _, target in (updated or []):
+        parts.append(f"updated '{target}'")
+    for source, target in (linked or []):
+        parts.append(f"linked '{source}' to '{target}'")
+    for title in (deleted or []):
+        parts.append(f"deleted '{title}'")
+    for _, existing in duplicates:
+        parts.append(f"recognized as duplicate of '{existing}'")
+    for desc, _ in failed:
+        parts.append(f"failed on '{desc}'")
+    if not_content:
+        parts.append("refused as an unclear/ambiguous instruction")
+    return "; ".join(parts) if parts else "nothing happened"
+
+
+def _history_subject(created, duplicates, updated, deleted, linked) -> str | None:
+    """The single note this turn was primarily 'about', if any -- carried
+    forward as a guaranteed RAG candidate for the next turn so a pronoun
+    follow-up ("delete it", "it also does X") isn't at the mercy of whether
+    the pronoun-heavy text happens to embed-match that note on its own.
+    Deleted notes are deliberately excluded: nothing to carry forward to."""
+    if created:
+        return created[0][0]
+    if updated:
+        return updated[0][1]
+    if linked:
+        return linked[0][0]
+    if duplicates:
+        return duplicates[0][1]
+    return None
 
 
 def _print_summary(created, duplicates, failed, not_content=False, updated=None, deleted=None, linked=None):
@@ -171,6 +235,14 @@ def main():
 
     console.print(HELP_TEXT)
 
+    # Short-term memory: recent {"capture", "summary", "subject"} turns from
+    # THIS session only (never persisted -- the vault itself is the
+    # long-term memory), so a later capture like "delete it" or "add more to
+    # that" can resolve what "it"/"that" refers to. Capped at
+    # SESSION_MEMORY_SIZE so prompts don't grow without bound over a long
+    # session. process_capture() mutates this list in place.
+    session_history = []
+
     while True:
         try:
             text = console.input("\n[bold cyan]capture>[/bold cyan] ").strip()
@@ -190,7 +262,7 @@ def main():
                 list_recent(index)
             else:
                 with console.status("Thinking..."):
-                    process_capture(text, index)
+                    process_capture(text, index, session_history)
         except (EOFError, KeyboardInterrupt):
             break
         except Exception as e:

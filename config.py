@@ -39,6 +39,14 @@ DEDUP_TOP_K = int(os.environ.get("DEDUP_TOP_K", "8"))
 # one-line input instead of just capturing it as-is.
 ATOMIZE_MIN_WORDS = int(os.environ.get("ATOMIZE_MIN_WORDS", "12"))
 
+# How many recent turns of this session's REPL conversation get carried as
+# context into every LLM call -- lets a capture like "delete it" or "add more
+# to that" resolve what "it"/"that" refers to. Not persisted across restarts
+# (that's what makes it short-term rather than the vault itself, which is the
+# actual long-term memory) and deliberately small: this is for resolving
+# immediate references, not a growing transcript fed into every call forever.
+SESSION_MEMORY_SIZE = int(os.environ.get("SESSION_MEMORY_SIZE", "10"))
+
 # A candidate scoring at or above this is auto-linked regardless of whether
 # the LLM's own "links" field mentioned it. Measured directly: given a
 # clearly-related candidate right there in the prompt, the model only

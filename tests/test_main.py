@@ -12,6 +12,124 @@ def ready_ollama(mocker):
     mocker.patch.object(main, "check_ollama", return_value=None)
 
 
+class TestHistorySummary:
+    def test_created_note_summarized(self):
+        summary = main._history_summary([("X", "path.md", "concept")], [], [], [], [], [], False)
+        assert "filed 'X' (concept)" in summary
+
+    def test_updated_note_summarized(self):
+        summary = main._history_summary([], [], [("raw", "Target")], [], [], [], False)
+        assert "updated 'Target'" in summary
+
+    def test_linked_note_summarized(self):
+        summary = main._history_summary([], [], [], [], [("Source", "Target")], [], False)
+        assert "linked 'Source' to 'Target'" in summary
+
+    def test_deleted_note_summarized(self):
+        summary = main._history_summary([], [], [], ["X"], [], [], False)
+        assert "deleted 'X'" in summary
+
+    def test_duplicate_summarized(self):
+        summary = main._history_summary([], [("raw", "Existing")], [], [], [], [], False)
+        assert "recognized as duplicate of 'Existing'" in summary
+
+    def test_not_content_summarized(self):
+        summary = main._history_summary([], [], [], [], [], [], True)
+        assert "refused" in summary
+
+    def test_nothing_happened_has_a_summary(self):
+        assert main._history_summary([], [], [], [], [], [], False) == "nothing happened"
+
+
+class TestHistorySubject:
+    def test_created_note_is_the_subject(self):
+        assert main._history_subject([("X", "path.md", "concept")], [], [], [], []) == "X"
+
+    def test_updated_note_is_the_subject(self):
+        assert main._history_subject([], [], [("raw", "Target")], [], []) == "Target"
+
+    def test_linked_source_is_the_subject(self):
+        assert main._history_subject([], [], [], [], [("Source", "Target")]) == "Source"
+
+    def test_duplicate_of_is_the_subject(self):
+        assert main._history_subject([], [("raw", "Existing")], [], [], []) == "Existing"
+
+    def test_deleted_note_has_no_subject_to_carry_forward(self):
+        assert main._history_subject([], [], [], ["X"], []) is None
+
+    def test_nothing_happened_has_no_subject(self):
+        assert main._history_subject([], [], [], [], []) is None
+
+
+class TestSessionMemoryAccumulation:
+    def test_process_capture_mutates_session_history_with_summary_and_subject(self, mocker, vault_path):
+        index = RagIndex()
+        mocker.patch.object(agent, "process_capture", return_value=[
+            {"action": "create", "title": "X", "type": "concept", "tags": [], "body": "b", "links": []},
+        ])
+        session_history = []
+        main.process_capture("an idea", index, session_history)
+        assert "filed 'X'" in session_history[-1]["summary"]
+        assert session_history[-1]["subject"] == "X"
+
+    def test_previous_turns_subject_is_injected_as_a_candidate(self, mocker, vault_path):
+        # Regression: a pronoun-heavy follow-up like "it also uses Ollama" can
+        # embed-score too low against the note it refers to for RAG to ever
+        # retrieve it as a candidate at all -- carry the prior turn's subject
+        # forward as a guaranteed candidate instead of relying on embedding luck.
+        index = RagIndex()
+        mocker.patch.object(agent, "process_capture", return_value=[
+            {"action": "create", "title": "Idea Agent", "type": "project", "tags": [], "body": "b", "links": []},
+        ])
+        session_history = []
+        main.process_capture("Idea Agent is a local RAG filing tool", index, session_history)
+
+        seen_candidates = {}
+
+        def fake_process_capture(capture_text, candidates, known_notes, history):
+            seen_candidates["candidates"] = candidates
+            return [{"action": "not_content"}]
+
+        mocker.patch.object(agent, "process_capture", side_effect=fake_process_capture)
+        mocker.patch.object(index, "query", return_value=[])
+        main.process_capture("it also uses Ollama", index, session_history)
+
+        titles = [c["title"] for c in seen_candidates["candidates"]]
+        assert "Idea Agent" in titles
+
+    def test_repl_passes_growing_history_into_agent_calls(self, mocker, ready_ollama, vault_path):
+        # call_args_list stores a REFERENCE to the (mutated-in-place) history
+        # list, not a snapshot -- inspecting it after main() returns would
+        # only ever show its final state. Snapshot (copy) at call time instead.
+        mocker.patch.object(main.console, "input", side_effect=["first idea here", "second idea here", "/quit"])
+        seen_histories = []
+
+        def fake_process_capture(capture_text, candidates, known_notes, session_history):
+            seen_histories.append(list(session_history))
+            return [{"action": "create", "title": "X", "type": "concept", "tags": [], "body": "b", "links": []}]
+
+        mocker.patch.object(agent, "process_capture", side_effect=fake_process_capture)
+        main.main()
+        assert seen_histories[0] == []
+        assert len(seen_histories[1]) == 1
+        assert seen_histories[1][0]["capture"] == "first idea here"
+
+    def test_history_is_capped_at_configured_size(self, mocker, ready_ollama, vault_path):
+        mocker.patch.object(config, "SESSION_MEMORY_SIZE", 2)
+        inputs = [f"idea number {i}" for i in range(5)] + ["/quit"]
+        mocker.patch.object(main.console, "input", side_effect=inputs)
+        seen_histories = []
+
+        def fake_process_capture(capture_text, candidates, known_notes, session_history):
+            seen_histories.append(list(session_history))
+            return [{"action": "create", "title": "X", "type": "concept", "tags": [], "body": "b", "links": []}]
+
+        mocker.patch.object(agent, "process_capture", side_effect=fake_process_capture)
+        main.main()
+        assert all(len(h) <= 2 for h in seen_histories)
+        assert len(seen_histories[-1]) == 2
+
+
 class TestCheckOllama:
     def test_server_unreachable(self, mocker):
         mocker.patch.object(main.ollama, "Client", side_effect=ConnectionError("down"))

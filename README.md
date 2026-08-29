@@ -46,6 +46,16 @@ of that measurement, not out of guessing:
   fuzzy or semantic matching.** Delete and link only ever act on a title the model copied
   verbatim from the vault's real note list; case/hyphen/spacing differences are normalized
   away, but a name that doesn't resolve to a real note is refused, not guessed at.
+- **Session memory fixes retrieval, not just judgment -- carrying the prior turn's subject
+  forward as a candidate, not just adding conversation text to the prompt.** Feeding recent
+  turns into the LLM's prompts alone fixed pronoun resolution for commands ("delete it" against
+  a note just discussed, confirmed live: 5/5 correct with history vs. 0/5 without), but a
+  pronoun-heavy follow-up like "it also uses Ollama" still failed to append to the note it
+  clearly referred to -- because candidate retrieval is pure embedding similarity on the raw
+  text, and a sentence built almost entirely of pronouns doesn't embed close enough to score as
+  a candidate at all, regardless of what the LLM is told. Fixed by carrying the previous turn's
+  subject note forward as a guaranteed candidate every turn, independent of its embedding
+  score.
 
 Routine filing (duplicates, small updates) never edits or deletes a note -- duplicates get
 logged to that day's log note with a link to what already covers it, updates get appended
@@ -55,6 +65,11 @@ instructed to.
 
 ## How it works
 
+0. On launch, the RAG index is synced against every note already in the vault -- so the agent
+   starts each session already knowing everything you've filed, not just what happens in that
+   session. On top of that, a short-term memory of the current session's own turns (capped at
+   `SESSION_MEMORY_SIZE`, never persisted to disk) is fed into every check so later captures
+   like "delete it" or "it also does X" can resolve what "it" refers to.
 1. You type a capture at the `capture>` prompt.
 2. If it's an instruction naming existing note(s) unambiguously (delete, link), it's executed
    directly -- delete requires an independent re-confirmation pass first, and always goes to
@@ -125,7 +140,7 @@ pip install -r requirements-dev.txt
 pytest
 ```
 
-208 tests, no live Ollama server or network access required -- the embedding model and
+230 tests, no live Ollama server or network access required -- the embedding model and
 `ollama.chat` are mocked/faked for speed and determinism.
 
 ## Configuration
@@ -141,4 +156,5 @@ All settings live in `.env`:
 | `DEDUP_RETRIEVE_SCORE` | `0.40` | Minimum cosine similarity to pull a note in as a dedup/relation candidate |
 | `DEDUP_TOP_K` | `8` | Max candidates retrieved per capture |
 | `ATOMIZE_MIN_WORDS` | `12` | Below this word count, atomization is forced to exactly one note |
+| `SESSION_MEMORY_SIZE` | `10` | Recent session turns kept in short-term memory for resolving "it"/"that" |
 | `AUTO_LINK_SCORE` | `0.50` | Minimum similarity for auto-linking/append/type-hint (a single dominant related note) |

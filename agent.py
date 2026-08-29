@@ -35,6 +35,10 @@ EXACT existing titles and describes doing something to them -- deleting, linking
 merging -- that is always an instruction, even if the phrasing itself sounds like a neutral
 statement (e.g. "link A to B" naming two real note titles is an instruction, not content).
 
+You may also be given recent conversation from this session. A short input like "delete it" or
+"add more to that" is an instruction if the recent conversation makes clear what "it"/"that"
+refers to -- treat resolved pronouns the same as an explicit existing title.
+
 Examples of instructions (is_instruction: true) -- all explicitly about the tool's own notes/files:
 "Make me a file that links to another file." "Edit that note and add X." "Delete the old
 notes." "Create an empty folder [in the vault]." "Organize my vault." "Make a project folder
@@ -66,6 +70,12 @@ partially match a title. If the instruction is vague ("delete the old notes", "c
 "organize my vault"), names something not in the list, or could plausibly mean more than one
 note, respond "unclear" -- do not guess which note(s) it means.
 
+You may be given recent conversation from this session. If the instruction uses "it"/"that"/
+"the one I just mentioned" and the recent conversation clearly identifies exactly one specific
+existing note being discussed, that counts as unambiguously naming it -- resolve the pronoun to
+that note's exact title. If the recent conversation doesn't clearly resolve it to one specific
+note, treat it as unclear rather than guessing.
+
 Respond with ONLY a JSON object, one of:
 {"action": "delete", "target": str}
 {"action": "link", "source": str, "target": str}
@@ -79,6 +89,11 @@ matching is done and correct; small wording differences between the instruction 
 note's exact title (spacing, hyphens, capitalization -- e.g. "HNSW indexing" vs
 "HNSW-indexing") are normal and do NOT indicate a wrong match. Do not re-judge whether the
 title matches; only judge intent.
+
+If the instruction uses a pronoun ("delete it", "remove that"), you may be given recent
+conversation from this session explaining what it refers to -- that resolution is ALSO
+already done and correct; do not doubt it just because the instruction itself doesn't name
+the note explicitly. Judge only whether deleting is really what's meant, given that context.
 
 Answer yes ONLY if the instruction's INTENT clearly and specifically means to delete this
 note's subject. Answer no if there is genuine doubt about the intent itself -- e.g. the
@@ -150,6 +165,11 @@ ATOMICITY:
 You may also be given RELATED notes (not duplicates, just related) -- link to them by exact
 title when a note you create is genuinely, specifically connected to one.
 
+You may also be given recent conversation from this session. If the raw capture uses a pronoun
+or reference ("it", "that", "the one I just mentioned") use the recent conversation to resolve
+what it refers to and write the note about that actual subject -- do not leave a vague pronoun
+in the title or body.
+
 WRITING STYLE:
 - Information-dense, concise, technical. No fluff, no filler sentences.
 - title: specific and descriptive, not a broad category name.
@@ -210,8 +230,27 @@ def _titles_block(known_titles: list[str]) -> str:
     return "\n".join(f"- {t}" for t in known_titles) or "(vault is empty, no notes exist)"
 
 
-def _call_meta_check(capture_text: str, known_titles: list[str]) -> dict:
-    prompt = f"Existing note titles:\n{_titles_block(known_titles)}\n\nInput:\n{capture_text}"
+def _format_session_history(session_history: list[dict]) -> str:
+    """Short-term memory: the last few turns of THIS REPL session, so a
+    capture like "delete it" or "add more to that" can resolve what "it"/
+    "that" refers to. Pronouns carry almost no embedding signal, so RAG
+    retrieval alone can't do this -- it needs the actual recent conversation.
+    Empty when there's no history yet (start of session, or nothing relevant
+    happened), which is the common case and adds nothing to the prompt."""
+    if not session_history:
+        return ""
+    lines = "\n".join(f'- You said: "{t["capture"]}" -> {t["summary"]}' for t in session_history)
+    return (
+        f'\nRecent conversation in this session (most recent last) -- use this to resolve '
+        f'references like "it"/"that"/"the one I just mentioned" in the current input:\n{lines}\n'
+    )
+
+
+def _call_meta_check(capture_text: str, known_titles: list[str], session_history: list[dict] = None) -> dict:
+    prompt = (
+        f"Existing note titles:\n{_titles_block(known_titles)}\n"
+        f"{_format_session_history(session_history)}\nInput:\n{capture_text}"
+    )
     response = ollama.chat(
         model=config.OLLAMA_MODEL, format="json",
         messages=[
@@ -222,8 +261,11 @@ def _call_meta_check(capture_text: str, known_titles: list[str]) -> dict:
     return json.loads(response["message"]["content"])
 
 
-def _call_command_parse(capture_text: str, known_titles: list[str]) -> dict:
-    prompt = f"Existing note titles:\n{_titles_block(known_titles)}\n\nInstruction:\n{capture_text}"
+def _call_command_parse(capture_text: str, known_titles: list[str], session_history: list[dict] = None) -> dict:
+    prompt = (
+        f"Existing note titles:\n{_titles_block(known_titles)}\n"
+        f"{_format_session_history(session_history)}\nInstruction:\n{capture_text}"
+    )
     response = ollama.chat(
         model=config.OLLAMA_MODEL, format="json",
         messages=[
@@ -234,10 +276,11 @@ def _call_command_parse(capture_text: str, known_titles: list[str]) -> dict:
     return json.loads(response["message"]["content"])
 
 
-def _call_delete_confirm(capture_text: str, target: dict) -> dict:
+def _call_delete_confirm(capture_text: str, target: dict, session_history: list[dict] = None) -> dict:
     prompt = (
         f'Instruction:\n{capture_text}\n\nIdentified target note: "{target["title"]}" '
-        f'(type: {target.get("type", "concept")}): {target.get("excerpt", "")}'
+        f'(type: {target.get("type", "concept")}): {target.get("excerpt", "")}\n'
+        f'{_format_session_history(session_history)}'
     )
     response = ollama.chat(
         model=config.OLLAMA_MODEL, format="json",
@@ -249,10 +292,11 @@ def _call_delete_confirm(capture_text: str, target: dict) -> dict:
     return json.loads(response["message"]["content"])
 
 
-def _call_append_check(capture_text: str, candidate: dict) -> dict:
+def _call_append_check(capture_text: str, candidate: dict, session_history: list[dict] = None) -> dict:
     prompt = (
         f'Existing note: "{candidate["title"]}" (type: {candidate.get("type", "concept")}): '
-        f'{candidate.get("excerpt", "")}\n\nNew capture:\n{capture_text}'
+        f'{candidate.get("excerpt", "")}\n'
+        f'{_format_session_history(session_history)}\nNew capture:\n{capture_text}'
     )
     response = ollama.chat(
         model=config.OLLAMA_MODEL, format="json",
@@ -264,8 +308,11 @@ def _call_append_check(capture_text: str, candidate: dict) -> dict:
     return json.loads(response["message"]["content"])
 
 
-def _call_duplicate_check(capture_text: str, candidates: list[dict]) -> dict:
-    prompt = f"Existing notes:\n{_format_candidates(candidates)}\n\nNew capture:\n{capture_text}"
+def _call_duplicate_check(capture_text: str, candidates: list[dict], session_history: list[dict] = None) -> dict:
+    prompt = (
+        f"Existing notes:\n{_format_candidates(candidates)}\n"
+        f"{_format_session_history(session_history)}\nNew capture:\n{capture_text}"
+    )
     response = ollama.chat(
         model=config.OLLAMA_MODEL, format="json",
         messages=[
@@ -276,10 +323,11 @@ def _call_duplicate_check(capture_text: str, candidates: list[dict]) -> dict:
     return json.loads(response["message"]["content"])
 
 
-def _call_atomize(capture_text: str, candidates: list[dict]) -> dict:
+def _call_atomize(capture_text: str, candidates: list[dict], session_history: list[dict] = None) -> dict:
     prompt = (
         f"Related notes (not duplicates):\n{_format_candidates(candidates)}\n"
         f"{_relation_hint(candidates)}"
+        f"{_format_session_history(session_history)}"
         f"{_vague_guard(capture_text)}\nRaw capture:\n{capture_text}"
     )
     response = ollama.chat(
@@ -325,15 +373,16 @@ def _normalize_note(item: dict, fallback_title: str, linkable_titles: set) -> di
     }
 
 
-def _one_meta_vote(capture_text: str, known_titles: list[str]) -> bool:
+def _one_meta_vote(capture_text: str, known_titles: list[str], session_history: list[dict]) -> bool:
     try:
-        result = _call_meta_check(capture_text, known_titles)
+        result = _call_meta_check(capture_text, known_titles, session_history)
         return isinstance(result, dict) and bool(result.get("is_instruction", False))
     except Exception:
         return False
 
 
-def _is_meta_command(capture_text: str, known_titles: list[str] = None, votes: int = 3) -> bool:
+def _is_meta_command(capture_text: str, known_titles: list[str] = None,
+                      session_history: list[dict] = None, votes: int = 3) -> bool:
     """True if the capture is an instruction directed at the tool (create,
     edit, delete, organize) rather than genuine content to record.
 
@@ -356,12 +405,13 @@ def _is_meta_command(capture_text: str, known_titles: list[str] = None, votes: i
     ambiguous feature-idea phrasings, 6/6 correct on 5 clear instructions.
     """
     known_titles = known_titles or []
-    return all(_one_meta_vote(capture_text, known_titles) for _ in range(votes))
+    return all(_one_meta_vote(capture_text, known_titles, session_history) for _ in range(votes))
 
 
-def _one_duplicate_vote(capture_text: str, candidates: list[dict], candidate_titles: set) -> str | None:
+def _one_duplicate_vote(capture_text: str, candidates: list[dict], candidate_titles: set,
+                         session_history: list[dict]) -> str | None:
     try:
-        result = _call_duplicate_check(capture_text, candidates)
+        result = _call_duplicate_check(capture_text, candidates, session_history)
         if not isinstance(result, dict):
             return None
         target = _as_str(result.get("duplicate_of"), "")
@@ -370,7 +420,8 @@ def _one_duplicate_vote(capture_text: str, candidates: list[dict], candidate_tit
         return None
 
 
-def _check_duplicate(capture_text: str, candidates: list[dict], votes: int = 3) -> str | None:
+def _check_duplicate(capture_text: str, candidates: list[dict],
+                      session_history: list[dict] = None, votes: int = 3) -> str | None:
     """Returns the exact title of a genuine duplicate candidate, or None.
 
     Measured directly: a single call to the local model missed an exact-match
@@ -389,21 +440,22 @@ def _check_duplicate(capture_text: str, candidates: list[dict], votes: int = 3) 
         return None
     candidate_titles = {c["title"] for c in candidates}
     for _ in range(votes):
-        vote = _one_duplicate_vote(capture_text, candidates, candidate_titles)
+        vote = _one_duplicate_vote(capture_text, candidates, candidate_titles, session_history)
         if vote:
             return vote
     return None
 
 
-def _one_append_vote(capture_text: str, candidate: dict) -> bool:
+def _one_append_vote(capture_text: str, candidate: dict, session_history: list[dict]) -> bool:
     try:
-        result = _call_append_check(capture_text, candidate)
+        result = _call_append_check(capture_text, candidate, session_history)
         return isinstance(result, dict) and bool(result.get("append", False))
     except Exception:
         return False
 
 
-def _check_append(capture_text: str, candidates: list[dict], votes: int = 3) -> dict | None:
+def _check_append(capture_text: str, candidates: list[dict],
+                   session_history: list[dict] = None, votes: int = 3) -> dict | None:
     """Returns the single strong candidate to append to, or None. Scoped to
     exactly one dominant candidate (reusing AUTO_LINK_SCORE, same threshold
     as auto-linking/the type relation hint) -- with 0 or 2+ strong matches
@@ -420,18 +472,18 @@ def _check_append(capture_text: str, candidates: list[dict], votes: int = 3) -> 
         return None
     candidate = strong[0]
     for _ in range(votes):
-        if _one_append_vote(capture_text, candidate):
+        if _one_append_vote(capture_text, candidate, session_history):
             return candidate
     return None
 
 
-def _atomize(capture_text: str, candidates: list[dict]) -> list[dict]:
+def _atomize(capture_text: str, candidates: list[dict], session_history: list[dict] = None) -> list[dict]:
     candidate_titles = {c["title"] for c in candidates}
     fallback_title = capture_text.strip()[:60] or "Untitled"
 
     for _ in range(2):
         try:
-            result = _call_atomize(capture_text, candidates)
+            result = _call_atomize(capture_text, candidates, session_history)
             if not isinstance(result, dict):
                 continue
             result = {str(k).lower(): v for k, v in result.items()}
@@ -497,16 +549,23 @@ def _find_by_title(title: str, known_notes: list[dict]) -> dict | None:
     return None
 
 
-def _confirm_delete(capture_text: str, target: dict, votes: int = 3) -> bool:
+def _confirm_delete(capture_text: str, target: dict, session_history: list[dict] = None,
+                     votes: int = 3) -> bool:
     """Unanimous re-confirmation, independent of and in addition to the
     initial command parse -- delete is the one operation in this codebase
     with no recovery path inside the tool itself (only the OS recycle bin).
     Same bias as the meta-command check: a missed delete costs nothing (the
     user just asks again), a wrong delete costs real content, so this
-    requires every vote to agree and any doubt anywhere defaults to no."""
+    requires every vote to agree and any doubt anywhere defaults to no.
+
+    Needs session_history for the same reason command-parsing does: reported
+    live, "delete it" (pronoun) resolved correctly to the right note at parse
+    time, but confirmation without the session context that justified that
+    resolution had no way to verify it and refused every time -- it couldn't
+    tell "it" meant anything at all, let alone this specific note."""
     for _ in range(votes):
         try:
-            result = _call_delete_confirm(capture_text, target)
+            result = _call_delete_confirm(capture_text, target, session_history)
             if not (isinstance(result, dict) and bool(result.get("confirmed", False))):
                 return False
         except Exception:
@@ -514,22 +573,26 @@ def _confirm_delete(capture_text: str, target: dict, votes: int = 3) -> bool:
     return True
 
 
-def _parse_command(capture_text: str, known_notes: list[dict]) -> dict | None:
+def _parse_command(capture_text: str, known_notes: list[dict],
+                    session_history: list[dict] = None) -> dict | None:
     """Returns a ready-to-execute command dict, or None if the instruction
     was too vague/ambiguous to safely act on (caller should refuse it, same
     as before this existed). known_notes is the FULL list of {"title","path"}
     for every note in the vault -- targets must match one of these exactly;
-    a name the model invents or only partially matches is never trusted."""
+    a name the model invents or only partially matches is never trusted.
+    session_history lets "delete it"/"link that to X" resolve a pronoun to
+    one specific recently-discussed title -- still exact-match after that,
+    never fuzzy."""
     known_titles = [n["title"] for n in known_notes]
     try:
-        result = _call_command_parse(capture_text, known_titles)
+        result = _call_command_parse(capture_text, known_titles, session_history)
         if not isinstance(result, dict):
             return None
         action = str(result.get("action", "")).lower()
 
         if action == "delete":
             target = _find_by_title(_as_str(result.get("target"), ""), known_notes)
-            if not target or not _confirm_delete(capture_text, target):
+            if not target or not _confirm_delete(capture_text, target, session_history):
                 return None
             return {"action": "delete", "target_path": target["path"], "target_title": target["title"]}
 
@@ -547,7 +610,8 @@ def _parse_command(capture_text: str, known_notes: list[dict]) -> dict | None:
     return None
 
 
-def process_capture(capture_text: str, candidates: list[dict], known_notes: list[dict] = None) -> list[dict]:
+def process_capture(capture_text: str, candidates: list[dict], known_notes: list[dict] = None,
+                     session_history: list[dict] = None) -> list[dict]:
     """Returns a list of items, each one of:
     {"action": "create", "title", "type", "tags", "body", "links"},
     {"action": "append", "target_path", "target_title", "text"} -- a small
@@ -564,20 +628,28 @@ def process_capture(capture_text: str, candidates: list[dict], known_notes: list
     than one, etc.) -- refused rather than guessed at. Caught live: "make
     me a file that..." and "edit that file and add..." were both filed as
     nonsense notes about themselves before instruction-detection existed.
+
+    session_history is this REPL session's short-term memory (recent
+    {"capture", "summary"} turns, oldest first) -- lets a pronoun-only
+    capture like "delete it" or "add more to that" resolve against what was
+    just discussed, which RAG retrieval alone can't do since pronouns carry
+    almost no embedding signal. Not persisted across restarts; the vault
+    itself is the long-term memory, this is only for the current session.
+
     Never raises -- falls back to a single safe "create" item in the "concept"
     type on any failure (bad JSON, connection drop, malformed response)."""
     known_notes = known_notes or []
     known_titles = [n["title"] for n in known_notes]
-    if _is_meta_command(capture_text, known_titles):
-        command = _parse_command(capture_text, known_notes)
+    if _is_meta_command(capture_text, known_titles, session_history):
+        command = _parse_command(capture_text, known_notes, session_history)
         return [command] if command else [{"action": "not_content"}]
-    duplicate_of = _check_duplicate(capture_text, candidates)
+    duplicate_of = _check_duplicate(capture_text, candidates, session_history)
     if duplicate_of:
         return [{"action": "duplicate", "duplicate_of": duplicate_of, "note": ""}]
-    append_target = _check_append(capture_text, candidates)
+    append_target = _check_append(capture_text, candidates, session_history)
     if append_target:
         return [{
             "action": "append", "target_path": append_target["path"],
             "target_title": append_target["title"], "text": capture_text.strip(),
         }]
-    return _atomize(capture_text, candidates)
+    return _atomize(capture_text, candidates, session_history)

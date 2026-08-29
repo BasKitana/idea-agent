@@ -84,6 +84,46 @@ def append_response():
 # whole sequence shifts by one and later assertions fail for the wrong reason.
 
 
+class TestSessionHistory:
+    """Short-term memory: recent {"capture","summary"} turns from this REPL
+    session, so a pronoun-only capture like "delete it" can resolve what
+    "it" refers to -- RAG retrieval alone can't, since pronouns carry almost
+    no embedding signal."""
+
+    def test_empty_history_produces_empty_block(self):
+        assert agent._format_session_history([]) == ""
+        assert agent._format_session_history(None) == ""
+
+    def test_history_entries_appear_in_formatted_block(self):
+        history = [
+            {"capture": "Idea Agent uses Ollama", "summary": "filed 'Idea Agent' (project)"},
+            {"capture": "it also has RAG", "summary": "updated 'Idea Agent'"},
+        ]
+        block = agent._format_session_history(history)
+        assert "Idea Agent uses Ollama" in block
+        assert "filed 'Idea Agent' (project)" in block
+        assert "it also has RAG" in block
+
+    def test_session_history_reaches_the_meta_check_prompt(self, mocker):
+        # Proves the plumbing actually wires through process_capture() into
+        # the real LLM call, not just that the formatter works in isolation.
+        spy = mocker.patch.object(agent.ollama, "chat", return_value=instruction_response())
+        history = [{"capture": "Idea Agent Project", "summary": "filed 'Idea Agent Project' (project)"}]
+        agent.process_capture("delete it", [], [{"title": "Idea Agent Project", "path": "x.md"}], history)
+        sent_prompt = spy.call_args_list[0].kwargs["messages"][1]["content"]
+        assert "Idea Agent Project" in sent_prompt
+
+    def test_session_history_reaches_the_atomize_prompt(self, mocker):
+        spy = mocker.patch.object(agent.ollama, "chat", return_value=atomize_response(
+            [{"title": "X", "type": "concept", "tags": [], "body": "b", "links": []}]))
+        history = [{"capture": "a prior idea", "summary": "filed 'X' (concept)"}]
+        agent.process_capture("a completely different fresh idea with enough words", [], [], history)
+        # Last call in the sequence is the atomize call (meta-check short-circuits
+        # to False immediately since the mocked response lacks "is_instruction").
+        sent_prompt = spy.call_args_list[-1].kwargs["messages"][1]["content"]
+        assert "a prior idea" in sent_prompt
+
+
 class TestMetaCommandDetection:
     def test_instruction_short_circuits_before_any_other_call(self, mocker):
         # return_value repeats {"is_instruction": True} for every call,
@@ -284,6 +324,25 @@ class TestVaultCommands:
     re-confirmation on top of the initial parse -- the one operation here
     with no recovery path but the OS recycle bin, so it's deliberately
     biased toward refusing over guessing."""
+
+    def test_delete_with_pronoun_resolved_by_session_history(self, mocker):
+        # Reported live: "delete it" resolved correctly to the right note at
+        # parse time (which does see session_history), but confirmation
+        # without that same context had no way to verify the resolution and
+        # refused every time. Both stages need it.
+        history = [{"capture": "Idea Agent Project", "summary": "filed 'Idea Agent Project' (project)"}]
+        mocker.patch.object(agent.ollama, "chat", side_effect=[
+            instruction_response(), instruction_response(), instruction_response(),
+            delete_command_response("Old Note"),
+            confirm_response(True), confirm_response(True), confirm_response(True),
+        ])
+        result = agent.process_capture("delete it", [], KNOWN_NOTES, history)
+        assert result == [{
+            "action": "delete", "target_path": "01_Concepts/Old Note.md", "target_title": "Old Note",
+        }]
+        # The confirm call must have actually received the history, not just parse.
+        confirm_call = agent.ollama.chat.call_args_list[4]
+        assert "Idea Agent Project" in confirm_call.kwargs["messages"][1]["content"]
 
     def test_delete_matches_title_despite_hyphen_case_difference(self, mocker):
         # Reported live: a note auto-titled "HNSW-indexing" by atomize
